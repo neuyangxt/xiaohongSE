@@ -1,0 +1,32 @@
+{
+  "color": [
+    {
+      "name": "start_window_background",
+      "value": "#1F2937"
+    },
+    {
+      "name": "app_primary",
+      "value": "#60A5FA"
+    },
+    {
+      "name": "app_accent",
+      "value": "#818CF8"
+    },
+    {
+      "name": "page_background",
+      "value": "#111827"
+    },
+    {
+      "name": "card_background",
+      "value": "#1F2937"
+    },
+    {
+      "name": "text_primary",
+      "value": "#F9FAFB"
+    },
+    {
+      "name": "text_secondary",
+      "value": "#9CA3AF"
+    }
+  ]
+}
