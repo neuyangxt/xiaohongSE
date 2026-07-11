@@ -1,0 +1,343 @@
+#include "ohos_liteos_bridge.h"
+
+#include <stdint.h>
+#include <stdbool.h>
+
+#include "driver/gptimer.h"
+#include "esp_attr.h"
+#include "esp_cpu.h"
+#include "esp_err.h"
+#include "esp_intr_alloc.h"
+#include "esp_log.h"
+#include "esp_private/gptimer.h"
+#include "esp_rom_sys.h"
+#include "hal/timer_ll.h"
+#include "los_task.h"
+#include "soc/timer_group_struct.h"
+
+extern volatile unsigned long long g_ohos_tick_count;
+extern volatile unsigned int g_ohos_in_tick_isr;
+
+extern unsigned int LOS_KernelInit(void);
+extern unsigned int LOS_Start(void);
+extern unsigned int ohos_liteos_create_test_task(void);
+extern void ohos_liteos_dump_sched_state(void);
+extern void ohos_mret_probe(void);
+
+extern const uintptr_t ohos_p4_mtvt_table_vec20[];
+extern const uintptr_t ohos_p4_mtvt_table_vec21[];
+extern void ohos_p4_tick_isr(void);
+
+#ifndef LOS_OK
+#define LOS_OK 0U
+#endif
+
+#define OHOS_TAKEOVER_ROOT_TASK_PRIO     24
+#define OHOS_TAKEOVER_ROOT_TASK_STACK    0x4000
+#define OHOS_TAKEOVER_DELAY_TASK_PRIO    28
+#define OHOS_TAKEOVER_DELAY_TASK_STACK   0x1000
+#define OHOS_P4_MTVT_TABLE_ENTRIES       48
+
+static const char *TAG = "ohos_liteos";
+static bool g_ohos_skip_tick_start = false;
+
+static gptimer_handle_t g_ohos_tick_timer;
+static intr_handle_t g_ohos_tick_intr;
+static void (*g_ohos_tick_handler)(void *);
+static UINT32 g_ohos_takeover_root_task_id;
+static UINT32 g_ohos_takeover_delay_task_id;
+
+volatile unsigned int g_ohos_s3g_isr_count;
+volatile uint32_t *g_ohos_timg0_int_clr_reg;
+
+static inline uintptr_t OhosP4ReadMtvt(void)
+{
+    uintptr_t mtvt;
+    __asm__ __volatile__("csrr %0, 0x307" : "=r"(mtvt));
+    return mtvt;
+}
+
+static const uintptr_t *OhosP4SelectMtvtTable(int vecIndex)
+{
+    if (vecIndex == 20) {
+        return ohos_p4_mtvt_table_vec20;
+    }
+
+    if (vecIndex == 21) {
+        return ohos_p4_mtvt_table_vec21;
+    }
+
+    return NULL;
+}
+
+void IRAM_ATTR ohos_p4_tick_body(void)
+{
+    timer_ll_clear_intr_status(&TIMERG0, TIMER_LL_EVENT_ALARM(0));
+    timer_ll_enable_alarm(&TIMERG0, 0, true);
+    g_ohos_tick_count++;
+
+    if (g_ohos_tick_handler != NULL) {
+        g_ohos_in_tick_isr = 1U;
+        g_ohos_tick_handler(NULL);
+        g_ohos_in_tick_isr = 0U;
+    }
+}
+
+static bool IRAM_ATTR ohos_esp32p4_tick_timer_cb(gptimer_handle_t timer,
+                                                  const gptimer_alarm_event_data_t *edata,
+                                                  void *user_ctx)
+{
+    (void)timer;
+    (void)edata;
+    (void)user_ctx;
+    return false;
+}
+
+unsigned int ohos_esp32p4_tick_timer_start(void (*tickHandler)(void *))
+{
+    g_ohos_tick_handler = tickHandler;
+
+    if (g_ohos_skip_tick_start) {
+        ESP_LOGW(TAG, "OHOS tick timer start deferred until LiteOS takeover root task");
+        return 0;
+    }
+
+    if (g_ohos_tick_timer == NULL) {
+        gptimer_config_t timerConfig = {
+            .clk_src = GPTIMER_CLK_SRC_DEFAULT,
+            .direction = GPTIMER_COUNT_UP,
+            .resolution_hz = 1000000,
+        };
+
+        if (gptimer_new_timer(&timerConfig, &g_ohos_tick_timer) != ESP_OK) {
+            return 1;
+        }
+
+        gptimer_event_callbacks_t callbacks = {
+            .on_alarm = ohos_esp32p4_tick_timer_cb,
+        };
+
+        if (gptimer_register_event_callbacks(g_ohos_tick_timer, &callbacks, NULL) != ESP_OK) {
+            return 1;
+        }
+
+        if (gptimer_get_intr_handle(g_ohos_tick_timer, &g_ohos_tick_intr) != ESP_OK) {
+            return 1;
+        }
+
+        g_ohos_timg0_int_clr_reg = (volatile uint32_t *)&TIMERG0.int_clr_timers.val;
+
+        int cpu = esp_intr_get_cpu(g_ohos_tick_intr);
+        int intno = esp_intr_get_intno(g_ohos_tick_intr);
+
+        int vecIndex = 16 + intno;
+        uintptr_t oldMtvt = OhosP4ReadMtvt();
+        const uintptr_t *tickMtvtTable = OhosP4SelectMtvtTable(vecIndex);
+        if (tickMtvtTable == NULL) {
+            esp_rom_printf("[OHOS-TICK] unsupported cpu=%d intno=%d vecIndex=%d oldMtvt=%p\n",
+                           cpu,
+                           intno,
+                           vecIndex,
+                           (void *)oldMtvt);
+            return 1;
+        }
+
+        void *oldVecByIntno = NULL;
+        void *vecByIntno = NULL;
+        if ((oldMtvt != 0U) && vecIndex >= 0 && vecIndex < OHOS_P4_MTVT_TABLE_ENTRIES) {
+            const uintptr_t *oldTable = (const uintptr_t *)(oldMtvt & ~((uintptr_t)0x3f));
+            oldVecByIntno = (void *)oldTable[vecIndex];
+        }
+        vecByIntno = (void *)tickMtvtTable[vecIndex];
+
+        esp_rom_printf("[OHOS-TICK] prepare cpu=%d intno=%d vecIndex=%d oldMtvt=%p\n",
+                       cpu,
+                       intno,
+                       vecIndex,
+                       (void *)oldMtvt);
+        esp_rom_printf("[OHOS-TICK] static mtvt=%p oldVec=%p newVec=%p isr=%p\n",
+                       tickMtvtTable,
+                       oldVecByIntno,
+                       vecByIntno,
+                       ohos_p4_tick_isr);
+
+        gptimer_alarm_config_t alarmConfig = {
+            .alarm_count = 10000,
+            .reload_count = 0,
+            .flags.auto_reload_on_alarm = true,
+        };
+
+        if (gptimer_set_alarm_action(g_ohos_tick_timer, &alarmConfig) != ESP_OK) {
+            esp_rom_printf("[OHOS-TICK] set alarm failed\n");
+            return 1;
+        }
+
+        if (gptimer_enable(g_ohos_tick_timer) != ESP_OK) {
+            esp_rom_printf("[OHOS-TICK] enable failed\n");
+            return 1;
+        }
+
+        esp_cpu_intr_set_mtvt_addr((const void *)tickMtvtTable);
+        __asm__ __volatile__("fence.i" ::: "memory");
+    }
+
+    if (gptimer_start(g_ohos_tick_timer) != ESP_OK) {
+        return 1;
+    }
+
+    return 0;
+}
+
+
+static VOID *OhosTakeoverDelayProbeTask(UINT32 arg)
+{
+    (void)arg;
+
+    esp_rom_printf("[OHOS-TAKEOVER] delay probe task entered tick=%llu\n",
+                   g_ohos_tick_count);
+
+    while (1) {
+        unsigned long long before = g_ohos_tick_count;
+        LOS_TaskDelay(10);
+        esp_rom_printf("[OHOS-TAKEOVER] delay probe woke before=%llu after=%llu delta=%llu\n",
+                       before,
+                       g_ohos_tick_count,
+                       g_ohos_tick_count - before);
+    }
+
+    return NULL;
+}
+
+static VOID *OhosTakeoverRootTask(UINT32 arg)
+{
+    (void)arg;
+
+    esp_rom_printf("[OHOS-TAKEOVER] root task entered tick=%llu handler=%p\n",
+                   g_ohos_tick_count,
+                   g_ohos_tick_handler);
+
+    unsigned int tickRet = 1U;
+    if (g_ohos_tick_handler != NULL) {
+        tickRet = ohos_esp32p4_tick_timer_start(g_ohos_tick_handler);
+    }
+
+    esp_rom_printf("[OHOS-TAKEOVER] tick start ret=%u tick=%llu\n",
+                   tickRet,
+                   g_ohos_tick_count);
+
+    if (tickRet == LOS_OK) {
+        unsigned long long before = g_ohos_tick_count;
+        LOS_TaskDelay(5);
+        esp_rom_printf("[OHOS-TAKEOVER] root LOS_TaskDelay check before=%llu after=%llu delta=%llu\n",
+                       before,
+                       g_ohos_tick_count,
+                       g_ohos_tick_count - before);
+    } else {
+        esp_rom_printf("[OHOS-TAKEOVER] root skips LOS_TaskDelay check because tick start failed\n");
+    }
+
+    TSK_INIT_PARAM_S delayTask = {0};
+    delayTask.pfnTaskEntry = (TSK_ENTRY_FUNC)OhosTakeoverDelayProbeTask;
+    delayTask.usTaskPrio = OHOS_TAKEOVER_DELAY_TASK_PRIO;
+    delayTask.uwStackSize = OHOS_TAKEOVER_DELAY_TASK_STACK;
+    delayTask.pcName = "ohos_delay";
+    unsigned int delayRet = LOS_TaskCreate(&g_ohos_takeover_delay_task_id, &delayTask);
+    esp_rom_printf("[OHOS-TAKEOVER] delay probe task create ret=%u taskId=%u prio=%u stack=0x%x\n",
+                   delayRet,
+                   g_ohos_takeover_delay_task_id,
+                   OHOS_TAKEOVER_DELAY_TASK_PRIO,
+                   OHOS_TAKEOVER_DELAY_TASK_STACK);
+
+    unsigned int serviceRet = ohos_liteos_create_test_task();
+    esp_rom_printf("[OHOS-TAKEOVER] root SAMGR/UART start ret=%u\n", serviceRet);
+    ohos_liteos_dump_sched_state();
+
+    while (1) {
+        LOS_TaskDelay(100);
+        esp_rom_printf("[OHOS-TAKEOVER] root alive tick=%llu serviceRet=%u\n",
+                       g_ohos_tick_count,
+                       serviceRet);
+    }
+
+    return NULL;
+}
+
+
+int ohos_liteos_kernelinit_task_probe(void)
+{
+    ESP_LOGW(TAG, "OHOS kernelinit task probe start");
+    ESP_LOGW(TAG, "This probe calls LOS_KernelInit(), skips tick, creates test task, dumps sched, no LOS_Start");
+
+    g_ohos_skip_tick_start = true;
+    unsigned int ret = LOS_KernelInit();
+    g_ohos_skip_tick_start = false;
+
+    ESP_LOGW(TAG, "OHOS kernelinit task probe: LOS_KernelInit returned %u", ret);
+    if (ret != 0) {
+        return (int)ret;
+    }
+
+    ret = ohos_liteos_create_test_task();
+    ESP_LOGW(TAG, "OHOS kernelinit task probe: ohos_liteos_create_test_task returned %u", ret);
+    if (ret != 0) {
+        return (int)ret;
+    }
+
+    ohos_liteos_dump_sched_state();
+
+    ESP_LOGW(TAG, "OHOS kernelinit task probe done, task created, no LOS_Start");
+    return 0;
+}
+
+int ohos_liteos_bringup(bool start_scheduler)
+{
+    ESP_LOGI(TAG, "calling LOS_KernelInit()");
+    g_ohos_skip_tick_start = start_scheduler;
+    unsigned int ret = LOS_KernelInit();
+    g_ohos_skip_tick_start = false;
+    esp_rom_printf("[OHOS-TAKEOVER] LOS_KernelInit returned %u\n", ret);
+
+    if (ret != 0) {
+        return (int)ret;
+    }
+
+    if (!start_scheduler) {
+        ret = ohos_liteos_create_test_task();
+        ESP_LOGI(TAG, "ohos_liteos_create_test_task() returned %u", ret);
+
+        if (ret != 0) {
+            return (int)ret;
+        }
+
+        ohos_liteos_dump_sched_state();
+
+        ESP_LOGW(TAG, "running minimal mret probe");
+        ohos_mret_probe();
+        ESP_LOGW(TAG, "minimal mret probe returned");
+    }
+
+    if (start_scheduler) {
+        TSK_INIT_PARAM_S rootTask = {0};
+        rootTask.pfnTaskEntry = (TSK_ENTRY_FUNC)OhosTakeoverRootTask;
+        rootTask.usTaskPrio = OHOS_TAKEOVER_ROOT_TASK_PRIO;
+        rootTask.uwStackSize = OHOS_TAKEOVER_ROOT_TASK_STACK;
+        rootTask.pcName = "ohos_root";
+
+        ret = LOS_TaskCreate(&g_ohos_takeover_root_task_id, &rootTask);
+        esp_rom_printf("[OHOS-TAKEOVER] root task create ret=%u taskId=%u prio=%u stack=0x%x\n",
+                       ret,
+                       g_ohos_takeover_root_task_id,
+                       OHOS_TAKEOVER_ROOT_TASK_PRIO,
+                       OHOS_TAKEOVER_ROOT_TASK_STACK);
+        if (ret != LOS_OK) {
+            return (int)ret;
+        }
+
+        ohos_liteos_dump_sched_state();
+
+        esp_rom_printf("[OHOS-TAKEOVER] calling LOS_Start; LiteOS-M scheduler will take over\n");
+        return (int)LOS_Start();
+    }
+
+    return 0;
+}
