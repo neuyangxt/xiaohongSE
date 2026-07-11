@@ -1,0 +1,19 @@
+四模组智能家居示例（2026-06-30）
+
+固件对应关系：
+1. xiaohong_se_hub_all.fwpkg：烧录到小鸿 SE 开发板上的 WS63。
+2. sht30_server_all.fwpkg：烧录到温湿度模组。
+3. fan_server_all.fwpkg：烧录到智能风扇模组。
+4. alarm_server_all.fwpkg：烧录到声光报警器模组。
+5. light_server_all.fwpkg：烧录到智能照明模组。
+
+组网角色：
+- 小鸿 SE 的 WS63：SLE Client / Hub。
+- 四个模组：SLE Server。
+
+场景规则：
+- 居家模式：照明开启；温度达到 32.00 摄氏度或湿度超过 50% 时开启风扇。
+- 离家模式：照明和风扇关闭；温度达到 35.00 摄氏度或湿度超过 60% 时启动声光报警。
+- 温湿度模组在两种模式下均持续上报数据。
+
+建议先烧录四个模组，再烧录并启动小鸿 SE Hub。

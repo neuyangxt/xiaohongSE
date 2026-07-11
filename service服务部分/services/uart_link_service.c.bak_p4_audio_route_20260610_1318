@@ -1,0 +1,2360 @@
+#include <stdint.h>
+#include <string.h>
+
+#include "ohos_types.h"
+#include "ohos_uart_protocol.h"
+#include "ohos_errno.h"
+#include "los_task.h"
+#include "samgr_lite.h"
+#include "service_impl.h"
+#include "ohos_service_msg.h"
+#include "ohos_uart_link_config.h"
+#include "ohos_uart_link_ui.h"
+#include "ohos_service_common.h"
+#include "ohos_opus_codec.h"
+#include "ohos_audio_es7210_port.h"
+#include "ohos_audio_es8311_port.h"
+#include "ohos_liteos_media_task.h"
+#include "esp_log.h"
+#include "esp_rom_sys.h"
+#include "driver/uart.h"
+#include "driver/gpio.h"
+#include "soc/hp_sys_clkrst_struct.h"
+#include "soc/uart_struct.h"
+#include "los_sem.h"
+
+#ifndef LOS_OK
+#define LOS_OK 0U
+#endif
+
+#ifndef LOS_WAIT_FOREVER
+#define LOS_WAIT_FOREVER 0xffffffffU
+#endif
+
+extern UINT32 LOS_IntLock(VOID);
+extern VOID LOS_IntRestore(UINT32 intSave);
+
+#define OHOS_UART_LINK_SERVICE_NAME "UartLinkService"
+
+/*
+ * S41B loopback test:
+ *   UART1 TX -> GPIO10
+ *   UART1 RX -> GPIO11
+ *
+ * Before running this test, connect GPIO10 and GPIO11 with a jumper wire.
+ * If these pins are inconvenient on your board, change the two macros below.
+ */
+
+#define OHOS_UART_VERIFY_TASK_PRIO  25
+#define OHOS_UART_VERIFY_TASK_STACK 0x1000
+
+#define OHOS_UART_RX_TASK_PRIO      26
+#define OHOS_UART_RX_TASK_STACK     0x1000
+#define OHOS_UART_RX_STREAM_CAP     OHOS_UART_PROTO_MAX_FRAME_LEN
+#define OHOS_UART_TEXT_CACHE_CAP    512U
+#define OHOS_UART_SMALL_STRING_CAP  128U
+
+#define OHOS_UART_OPUS_QUEUE_DEPTH       8U
+#define OHOS_UART_OPUS_PLAY_TASK_PRIO    25
+#define OHOS_UART_OPUS_PLAY_TASK_STACK   0x8000
+#define OHOS_UART_UP_OPUS_TASK_PRIO      28
+#define OHOS_UART_UP_OPUS_TASK_STACK     0x3000
+#define OHOS_UART_UP_OPUS_STOP_POLL_MS   5U
+#define OHOS_UART_DOWN_AUDIO_DIRECT_MAX  256U
+#define OHOS_UART_DOWN_AUDIO_SPLIT_UNIT  OHOS_OPUS_UPLINK_TARGET_BYTES
+
+#define OHOS_UART_HANDSHAKE_TASK_PRIO        27
+#define OHOS_UART_HANDSHAKE_TASK_STACK       0x1000
+#define OHOS_UART_HANDSHAKE_MAX_RETRY        3
+#define OHOS_UART_HANDSHAKE_WAIT_TICKS       20
+
+static volatile uint32_t g_uart_service_init_count = 0;
+static volatile uint32_t g_uart_service_msg_count = 0;
+static volatile uint32_t g_uart_service_queue_ok = 0;
+static volatile uint32_t g_uart_service_send_ok = 0;
+static volatile uint32_t g_uart_service_status_ok = 0;
+static volatile uint32_t g_uart_service_selftest_ok = 0;
+static volatile uint32_t g_uart_service_send_msg_ok = 0;
+static volatile uint32_t g_uart_driver_init_ok = 0;
+static volatile uint32_t g_uart_loopback_ok = 0;
+static volatile int32_t g_uart_write_ret = -1;
+static volatile int32_t g_uart_read_ret = -1;
+
+static volatile uint32_t g_uart_rx_task_started = 0;
+static volatile uint32_t g_uart_rx_frame_count = 0;
+static volatile uint32_t g_uart_link_ready = 0;
+static volatile uint32_t g_uart_last_rx_cmd = 0;
+static volatile uint32_t g_uart_last_system_status = 0xFFFFFFFFU;
+static UINT32 g_uart_rx_task_id = 0;
+
+static volatile uint32_t g_uart_diag_tx_count = 0;
+static volatile uint32_t g_uart_rx_raw_count = 0;
+static volatile uint32_t g_uart_rx_raw_bytes = 0;
+static volatile uint32_t g_uart_rx_parse_fail_count = 0;
+static volatile uint32_t g_uart_handshake_task_started = 0;
+static volatile uint32_t g_uart_handshake_task_done = 0;
+static volatile uint32_t g_uart_query_tx_count = 0;
+static volatile uint32_t g_uart_query_tx_ok = 0;
+static UINT32 g_uart_handshake_task_id = 0;
+
+static uint8_t g_uart_rx_stream[OHOS_UART_RX_STREAM_CAP];
+static uint8_t g_uart_sync_stream[OHOS_UART_RX_STREAM_CAP];
+#if OHOS_UART_LINK_ENABLE_LONG_FRAME_SELFTEST
+static uint8_t g_uart_selftest_stream[OHOS_UART_RX_STREAM_CAP];
+static uint8_t g_uart_selftest_frame[OHOS_UART_PROTO_FRAME_FIXED_LEN + 384U];
+#endif
+static uint8_t g_uart_tx_frame[OHOS_UART_PROTO_MAX_FRAME_LEN];
+
+static volatile uint32_t g_uart_ws_url_len = 0;
+static char g_uart_ws_url[OHOS_UART_SMALL_STRING_CAP];
+static volatile uint32_t g_uart_wifi_ssid_len = 0;
+static char g_uart_wifi_ssid[OHOS_UART_SMALL_STRING_CAP];
+static volatile uint32_t g_uart_wifi_pswd_len = 0;
+static char g_uart_wifi_pswd[OHOS_UART_SMALL_STRING_CAP];
+static volatile uint32_t g_uart_down_text_count = 0;
+static volatile uint32_t g_uart_down_text_type = 0xFFFFFFFFU;
+static volatile uint32_t g_uart_down_text_len = 0;
+static char g_uart_down_text[OHOS_UART_TEXT_CACHE_CAP];
+static volatile uint32_t g_uart_down_audio_count = 0;
+static volatile uint32_t g_uart_down_audio_bytes = 0;
+static volatile uint32_t g_uart_down_audio_last_len = 0;
+
+typedef struct {
+    uint16_t len;
+    uint8_t data[OHOS_OPUS_MAX_FRAME_BYTES];
+} UartLinkOpusQueueSlot;
+
+static UartLinkOpusQueueSlot g_uart_opus_queue[OHOS_UART_OPUS_QUEUE_DEPTH];
+static uint8_t g_uart_opus_work_frame[OHOS_OPUS_MAX_FRAME_BYTES];
+static int16_t g_uart_opus_pcm[OHOS_OPUS_MAX_PCM_SAMPLES];
+static uint32_t g_uart_opus_read_idx = 0;
+static uint32_t g_uart_opus_write_idx = 0;
+static volatile uint32_t g_uart_opus_queue_count = 0;
+static volatile uint32_t g_uart_opus_enqueue_count = 0;
+static volatile uint32_t g_uart_opus_pop_count = 0;
+static volatile uint32_t g_uart_opus_drop_count = 0;
+static volatile uint32_t g_uart_opus_decode_ok = 0;
+static volatile uint32_t g_uart_opus_decode_fail = 0;
+static volatile uint32_t g_uart_opus_play_ok = 0;
+static volatile uint32_t g_uart_opus_play_fail = 0;
+static volatile uint32_t g_uart_opus_last_samples = 0;
+static volatile uint32_t g_uart_opus_last_len = 0;
+static volatile uint32_t g_uart_opus_task_started = 0;
+static UINT32 g_uart_opus_sem = 0;
+static volatile uint32_t g_uart_opus_sem_ready = 0;
+static UINT32 g_uart_opus_play_task_id = 0;
+
+static int16_t g_uart_up_opus_pcm[OHOS_OPUS_UPLINK_PCM_SAMPLES];
+static uint8_t g_uart_up_opus_payload[OHOS_OPUS_UPLINK_OUT_CAP];
+static uint8_t g_uart_up_opus_tx_frame[OHOS_UART_PROTO_FRAME_FIXED_LEN + OHOS_OPUS_UPLINK_OUT_CAP];
+static volatile uint32_t g_uart_up_opus_task_started = 0;
+static volatile uint32_t g_uart_up_opus_running = 0;
+static volatile uint32_t g_uart_up_opus_stop_req = 0;
+static volatile uint32_t g_uart_up_opus_start_count = 0;
+static volatile uint32_t g_uart_up_opus_stop_count = 0;
+static volatile uint32_t g_uart_up_opus_pcm_ok = 0;
+static volatile uint32_t g_uart_up_opus_pcm_fail = 0;
+static volatile uint32_t g_uart_up_opus_encode_ok = 0;
+static volatile uint32_t g_uart_up_opus_encode_fail = 0;
+static volatile uint32_t g_uart_up_opus_tx_ok = 0;
+static volatile uint32_t g_uart_up_opus_tx_fail = 0;
+static volatile uint32_t g_uart_up_opus_last_len = 0;
+static volatile uint32_t g_uart_up_opus_last_samples = 0;
+static volatile uint32_t g_uart_up_opus_last_peak = 0;
+static volatile uint32_t g_uart_up_opus_last_nonzero = 0;
+static volatile uint32_t g_uart_up_opus_last_ret = 0;
+static volatile uint32_t g_uart_up_opus_vad_session_active = 0;
+static volatile uint32_t g_uart_up_opus_vad_start_ok = 0;
+static volatile uint32_t g_uart_up_opus_vad_start_fail = 0;
+static volatile uint32_t g_uart_up_opus_vad_end_ok = 0;
+static volatile uint32_t g_uart_up_opus_vad_end_fail = 0;
+static UINT32 g_uart_up_opus_task_id = 0;
+
+static Identity g_uart_service_identity = {
+    .serviceId = -1,
+    .featureId = -1,
+    .queueId = NULL,
+};
+
+static uint32_t UartLinkSendUplinkOpusFrame(const uint8_t *payload, uint16_t payloadLen);
+static uint32_t UartLinkSendUplinkControlFrame(uint16_t cmdType, const char *tag);
+
+static void UartLinkUplinkOpusDelayStopAware(uint32_t totalMs)
+{
+    uint32_t elapsed = 0;
+
+    while (elapsed < totalMs && g_uart_up_opus_running && !g_uart_up_opus_stop_req) {
+        uint32_t step = totalMs - elapsed;
+        if (step > OHOS_UART_UP_OPUS_STOP_POLL_MS) {
+            step = OHOS_UART_UP_OPUS_STOP_POLL_MS;
+        }
+        OhosLiteosDelayMs(step);
+        elapsed += step;
+    }
+}
+
+static const char *UartLinkServiceGetName(Service *service)
+{
+    (void)service;
+    return OHOS_UART_LINK_SERVICE_NAME;
+}
+
+static void UartLinkDumpClockDiag(const char *stage)
+{
+    uint32_t actualBaud = 0;
+    esp_err_t baudRet = uart_get_baudrate(OHOS_UART_LINK_PORT, &actualBaud);
+
+    esp_rom_printf("[P4-UART-CLK] stage=%s uart=%d cfg_baud=%u actual_baud=%u baudRet=%d "
+                   "src_sel=%u sclk_div_num=%u sclk_div_numr=%u sclk_div_denom=%u "
+                   "clkdiv=%u clkdiv_frag=%u clkdiv_raw=0x%08x tx_sclk_en=%u rx_sclk_en=%u\n",
+                   stage ? stage : "unknown",
+                   OHOS_UART_LINK_PORT,
+                   (uint32_t)OHOS_UART_LINK_BAUDRATE,
+                   actualBaud,
+                   baudRet,
+                   (uint32_t)HP_SYS_CLKRST.peri_clk_ctrl111.reg_uart1_clk_src_sel,
+                   (uint32_t)HP_SYS_CLKRST.peri_clk_ctrl112.reg_uart1_sclk_div_num,
+                   (uint32_t)HP_SYS_CLKRST.peri_clk_ctrl112.reg_uart1_sclk_div_numerator,
+                   (uint32_t)HP_SYS_CLKRST.peri_clk_ctrl112.reg_uart1_sclk_div_denominator,
+                   (uint32_t)UART1.clkdiv_sync.clkdiv,
+                   (uint32_t)UART1.clkdiv_sync.clkdiv_frag,
+                   (uint32_t)UART1.clkdiv_sync.val,
+                   (uint32_t)UART1.clk_conf.tx_sclk_en,
+                   (uint32_t)UART1.clk_conf.rx_sclk_en);
+}
+
+static uint32_t UartLinkDriverInit(void)
+{
+    if (g_uart_driver_init_ok) {
+        uart_config_t uart_config = {
+            .baud_rate = OHOS_UART_LINK_BAUDRATE,
+            .data_bits = UART_DATA_8_BITS,
+            .parity = UART_PARITY_DISABLE,
+            .stop_bits = UART_STOP_BITS_1,
+            .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+            .rx_flow_ctrl_thresh = 0,
+            .source_clk = UART_SCLK_PLL_F80M,
+        };
+
+        esp_err_t paramRet = uart_param_config(OHOS_UART_LINK_PORT, &uart_config);
+        esp_err_t baudRet = uart_set_baudrate(OHOS_UART_LINK_PORT, OHOS_UART_LINK_BAUDRATE);
+        esp_err_t pinRet = uart_set_pin(OHOS_UART_LINK_PORT,
+                                        OHOS_UART_LINK_TX_GPIO, OHOS_UART_LINK_RX_GPIO,
+                                        UART_PIN_NO_CHANGE,
+                                        UART_PIN_NO_CHANGE);
+        uart_flush_input(OHOS_UART_LINK_PORT);
+        UartLinkDumpClockDiag("already_installed_reassert");
+        g_uart_driver_init_ok = (paramRet == ESP_OK && baudRet == ESP_OK && pinRet == ESP_OK);
+        esp_rom_printf("[OHOS-S46A] UartLinkService driver already installed reassert baud=%u paramRet=%d baudRet=%d pinRet=%d initOk=%u\n",
+                       OHOS_UART_LINK_BAUDRATE,
+                       paramRet,
+                       baudRet,
+                       pinRet,
+                       g_uart_driver_init_ok);
+        return g_uart_driver_init_ok;
+    }
+
+    uart_config_t uart_config = {
+        .baud_rate = OHOS_UART_LINK_BAUDRATE,
+        .data_bits = UART_DATA_8_BITS,
+        .parity = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1,
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+        .rx_flow_ctrl_thresh = 0,
+        .source_clk = UART_SCLK_PLL_F80M,
+    };
+
+    UartLinkDumpClockDiag("before_param_config");
+    esp_err_t paramRet = uart_param_config(OHOS_UART_LINK_PORT, &uart_config);
+    UartLinkDumpClockDiag("after_param_config");
+    esp_rom_printf("[WS63-UART-DIAG] config: baud=%u source=PLL_F80M TX=GPIO30 RX=GPIO31 8N1 no-flow\n",
+                   (uint32_t)OHOS_UART_LINK_BAUDRATE);
+    esp_err_t pinRet = uart_set_pin(OHOS_UART_LINK_PORT,
+                                    OHOS_UART_LINK_TX_GPIO, OHOS_UART_LINK_RX_GPIO,
+                                    UART_PIN_NO_CHANGE,
+                                    UART_PIN_NO_CHANGE);
+
+    esp_err_t installRet = uart_driver_install(OHOS_UART_LINK_PORT,
+                                               OHOS_UART_LINK_RX_BUF_SIZE,
+                                               OHOS_UART_LINK_TX_BUF_SIZE,
+                                               0,
+                                               NULL,
+                                               0);
+    if (installRet == ESP_OK) {
+        esp_err_t baudRet = uart_set_baudrate(OHOS_UART_LINK_PORT, OHOS_UART_LINK_BAUDRATE);
+        esp_rom_printf("[P4-UART-CLK] post install baud reassert ret=%d\n", baudRet);
+    }
+
+    uart_flush_input(OHOS_UART_LINK_PORT);
+    UartLinkDumpClockDiag("after_driver_install");
+
+    g_uart_driver_init_ok = (paramRet == ESP_OK &&
+                             pinRet == ESP_OK &&
+                             installRet == ESP_OK);
+
+    esp_rom_printf("[OHOS-S46A] UartLinkService driver init uart=%d tx=%d rx=%d baud=%u paramRet=%d pinRet=%d installRet=%d initOk=%u\n",
+                   OHOS_UART_LINK_PORT,
+                   OHOS_UART_LINK_TX_GPIO,
+                   OHOS_UART_LINK_RX_GPIO,
+                   OHOS_UART_LINK_BAUDRATE,
+                   paramRet,
+                   pinRet,
+                   installRet,
+                   g_uart_driver_init_ok);
+
+    return g_uart_driver_init_ok;
+}
+
+static uint32_t UartLinkLoopbackTest(void)
+{
+    const char *tx = "OHOS_UART_LOOPBACK_S46A";
+    char rx[64] = {0};
+
+    uart_flush_input(OHOS_UART_LINK_PORT);
+
+    g_uart_write_ret = uart_write_bytes(OHOS_UART_LINK_PORT, tx, strlen(tx));
+
+    /*
+     * Give UART enough time to transmit and receive through external TX-RX jumper.
+     */
+    LOS_TaskDelay(10);
+
+    g_uart_read_ret = esp_rom_printf("[WS63-UART-DIAG] rx task loop alive, waiting bytes...\n");
+        uart_read_bytes(OHOS_UART_LINK_PORT,
+                                      rx,
+                                      sizeof(rx) - 1,
+                                      50);
+
+    if (g_uart_read_ret > 0) {
+        rx[g_uart_read_ret] = '\0';
+    }
+
+    g_uart_loopback_ok = (g_uart_write_ret == (int32_t)strlen(tx) &&
+                          g_uart_read_ret == (int32_t)strlen(tx) &&
+                          strcmp(tx, rx) == 0);
+
+    esp_rom_printf("[OHOS-S46A] UartLinkService loopback write=%d read=%d tx=\"%s\" rx=\"%s\" loopOk=%u\n",
+                   g_uart_write_ret,
+                   g_uart_read_ret,
+                   tx,
+                   rx,
+                   g_uart_loopback_ok);
+
+    return g_uart_loopback_ok;
+}
+
+
+static void UartLinkDumpHex(const char *tag, const uint8_t *data, uint16_t len)
+{
+    const char *name = tag ? tag : "[WS63-UART-HEX]";
+    uint16_t dumpLen = (len > 96U) ? 96U : len;
+
+    if (data == NULL) {
+        esp_rom_printf("%s len=%u data=null\n", name, len);
+        return;
+    }
+
+    esp_rom_printf("%s len=%u data=", name, len);
+
+    for (uint16_t i = 0; i < dumpLen; ++i) {
+        esp_rom_printf("%02X", data[i]);
+        if ((uint16_t)(i + 1U) < dumpLen) {
+            esp_rom_printf(" ");
+        }
+    }
+
+    if (len > dumpLen) {
+        esp_rom_printf(" ...");
+    }
+
+    esp_rom_printf("\n");
+}
+
+static uint16_t UartLinkReadLe16(const uint8_t *p)
+{
+    return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
+}
+
+static uint16_t UartLinkSafeCopyText(char *dst, uint16_t dstCap, const uint8_t *src, uint16_t srcLen)
+{
+    uint16_t copyLen;
+
+    if (dst == NULL || dstCap == 0U) {
+        return 0;
+    }
+
+    copyLen = srcLen;
+    if (copyLen >= dstCap) {
+        copyLen = (uint16_t)(dstCap - 1U);
+    }
+
+    if (copyLen > 0U && src != NULL) {
+        memcpy(dst, src, copyLen);
+    }
+    dst[copyLen] = '\0';
+    return copyLen;
+}
+
+static uint16_t UartLinkKeepPartialHead(const uint8_t *stream, uint16_t streamLen)
+{
+    static const uint8_t head[4] = {0xA5, 0xA5, 0x5A, 0x5A};
+    uint16_t maxKeep = (streamLen < 3U) ? streamLen : 3U;
+
+    for (uint16_t keep = maxKeep; keep > 0U; --keep) {
+        if (memcmp(&stream[streamLen - keep], head, keep) == 0) {
+            return keep;
+        }
+    }
+
+    return 0;
+}
+
+static void UartLinkHandleStringData(const char *tag,
+                                     char *cache,
+                                     uint16_t cacheCap,
+                                     volatile uint32_t *cachedLen,
+                                     const OhosUartProtoFrame *frame)
+{
+    uint16_t copyLen;
+
+    if (frame == NULL || cache == NULL || cachedLen == NULL) {
+        return;
+    }
+
+    copyLen = UartLinkSafeCopyText(cache, cacheCap, frame->payload, frame->payload_len);
+    *cachedLen = frame->payload_len;
+
+    esp_rom_printf("[WS63-UART-DATA] %s cmd=0x%04x payloadLen=%u cachedLen=%u text=\"%s\"\n",
+                   tag ? tag : OhosUartProtoCmdName(frame->cmd_type),
+                   frame->cmd_type,
+                   frame->payload_len,
+                   copyLen,
+                   cache);
+}
+
+static void UartLinkHandleDownTextFrame(const OhosUartProtoFrame *frame)
+{
+    uint32_t textType;
+    uint16_t textLen;
+    uint16_t available;
+    uint16_t copyLen;
+
+    if (frame == NULL || frame->payload == NULL || frame->payload_len < 3U) {
+        g_uart_rx_parse_fail_count++;
+        esp_rom_printf("[WS63-UART-DOWN-TEXT] invalid payloadLen=%u failCnt=%u\n",
+                       frame ? frame->payload_len : 0U,
+                       g_uart_rx_parse_fail_count);
+        return;
+    }
+
+    textType = frame->payload[0];
+    textLen = UartLinkReadLe16(&frame->payload[1]);
+    available = (uint16_t)(frame->payload_len - 3U);
+
+    if (textLen > available) {
+        g_uart_rx_parse_fail_count++;
+        esp_rom_printf("[WS63-UART-DOWN-TEXT] length mismatch type=%u textLen=%u available=%u payloadLen=%u failCnt=%u\n",
+                       textType,
+                       textLen,
+                       available,
+                       frame->payload_len,
+                       g_uart_rx_parse_fail_count);
+        return;
+    }
+
+    copyLen = UartLinkSafeCopyText(g_uart_down_text,
+                                   OHOS_UART_TEXT_CACHE_CAP,
+                                   &frame->payload[3],
+                                   textLen);
+    g_uart_down_text_type = textType;
+    g_uart_down_text_len = textLen;
+    g_uart_down_text_count++;
+
+    esp_rom_printf("[WS63-UART-DOWN-TEXT] count=%u cmd=0x%04x payloadLen=%u type=%u textLen=%u cachedLen=%u text=\"%s\"\n",
+                   g_uart_down_text_count,
+                   frame->cmd_type,
+                   frame->payload_len,
+                   textType,
+                   textLen,
+                   copyLen,
+                   g_uart_down_text);
+}
+
+static void UartLinkOpusQueueEnqueue(const uint8_t *data, uint16_t len)
+{
+    uint32_t intSave;
+    uint32_t slot;
+    uint32_t dropped = 0;
+    uint32_t shouldWake = 0;
+
+    if (data == NULL || len == 0U) {
+        return;
+    }
+
+    if (len > OHOS_OPUS_MAX_FRAME_BYTES) {
+        g_uart_opus_drop_count++;
+        esp_rom_printf("[WS63-UART-OPUS] drop oversize len=%u max=%u drop=%u\n",
+                       len,
+                       OHOS_OPUS_MAX_FRAME_BYTES,
+                       g_uart_opus_drop_count);
+        return;
+    }
+
+    intSave = LOS_IntLock();
+    shouldWake = (g_uart_opus_queue_count == 0U);
+    if (g_uart_opus_queue_count >= OHOS_UART_OPUS_QUEUE_DEPTH) {
+        g_uart_opus_read_idx = (g_uart_opus_read_idx + 1U) % OHOS_UART_OPUS_QUEUE_DEPTH;
+        g_uart_opus_queue_count--;
+        g_uart_opus_drop_count++;
+        dropped = 1U;
+        shouldWake = 0;
+    }
+
+    slot = g_uart_opus_write_idx;
+    memcpy(g_uart_opus_queue[slot].data, data, len);
+    g_uart_opus_queue[slot].len = len;
+    g_uart_opus_write_idx = (g_uart_opus_write_idx + 1U) % OHOS_UART_OPUS_QUEUE_DEPTH;
+    g_uart_opus_queue_count++;
+    g_uart_opus_enqueue_count++;
+    g_uart_opus_last_len = len;
+    LOS_IntRestore(intSave);
+
+    if (g_uart_opus_sem_ready && shouldWake) {
+        (void)LOS_SemPost(g_uart_opus_sem);
+    }
+
+    if (dropped || g_uart_opus_enqueue_count <= 5U || (g_uart_opus_enqueue_count % 20U) == 0U) {
+        esp_rom_printf("[WS63-UART-OPUS] enqueue len=%u q=%u enq=%u drop=%u droppedOld=%u semReady=%u\n",
+                       len,
+                       g_uart_opus_queue_count,
+                       g_uart_opus_enqueue_count,
+                       g_uart_opus_drop_count,
+                       dropped,
+                       g_uart_opus_sem_ready);
+    }
+}
+
+static uint16_t UartLinkTrimZeroTailToSplitLen(const uint8_t *data, uint16_t len)
+{
+    uint16_t trimmed = len;
+
+    if (data == NULL || len <= OHOS_UART_DOWN_AUDIO_DIRECT_MAX) {
+        return len;
+    }
+
+    while (trimmed > OHOS_UART_DOWN_AUDIO_DIRECT_MAX && data[trimmed - 1U] == 0U) {
+        trimmed--;
+    }
+
+    if (trimmed >= OHOS_UART_DOWN_AUDIO_SPLIT_UNIT &&
+        (trimmed % OHOS_UART_DOWN_AUDIO_SPLIT_UNIT) == 0U) {
+        return trimmed;
+    }
+
+    return len;
+}
+
+static void UartLinkHandleDownAudioPayload(const uint8_t *data, uint16_t len)
+{
+    uint16_t effectiveLen;
+
+    if (data == NULL || len == 0U) {
+        g_uart_opus_drop_count++;
+        esp_rom_printf("[WS63-UART-DOWN-AUDIO] drop empty payload len=%u drop=%u\n",
+                       len,
+                       g_uart_opus_drop_count);
+        return;
+    }
+
+    if (len <= OHOS_UART_DOWN_AUDIO_DIRECT_MAX) {
+        UartLinkOpusQueueEnqueue(data, len);
+        return;
+    }
+
+    effectiveLen = UartLinkTrimZeroTailToSplitLen(data, len);
+    if ((effectiveLen % OHOS_UART_DOWN_AUDIO_SPLIT_UNIT) == 0U) {
+        uint16_t offset = 0;
+        uint16_t frames = (uint16_t)(effectiveLen / OHOS_UART_DOWN_AUDIO_SPLIT_UNIT);
+
+        esp_rom_printf("[WS63-UART-DOWN-AUDIO] split concatenated payload len=%u effective=%u frames=%u unit=%u\n",
+                       len,
+                       effectiveLen,
+                       frames,
+                       OHOS_UART_DOWN_AUDIO_SPLIT_UNIT);
+
+        while (offset < effectiveLen) {
+            UartLinkOpusQueueEnqueue(&data[offset], OHOS_UART_DOWN_AUDIO_SPLIT_UNIT);
+            offset = (uint16_t)(offset + OHOS_UART_DOWN_AUDIO_SPLIT_UNIT);
+        }
+        return;
+    }
+
+    g_uart_opus_drop_count++;
+    esp_rom_printf("[WS63-UART-DOWN-AUDIO] drop suspicious payload len=%u effective=%u directMax=%u unit=%u drop=%u\n",
+                   len,
+                   effectiveLen,
+                   OHOS_UART_DOWN_AUDIO_DIRECT_MAX,
+                   OHOS_UART_DOWN_AUDIO_SPLIT_UNIT,
+                   g_uart_opus_drop_count);
+}
+
+static uint16_t UartLinkOpusQueuePop(uint8_t *out, uint16_t outCap)
+{
+    uint32_t intSave;
+    uint32_t slot;
+    uint16_t len;
+
+    if (out == NULL || outCap == 0U) {
+        return 0;
+    }
+
+    intSave = LOS_IntLock();
+    if (g_uart_opus_queue_count == 0U) {
+        LOS_IntRestore(intSave);
+        return 0;
+    }
+
+    slot = g_uart_opus_read_idx;
+    len = g_uart_opus_queue[slot].len;
+    if (len > outCap) {
+        len = outCap;
+    }
+    memcpy(out, g_uart_opus_queue[slot].data, len);
+    g_uart_opus_read_idx = (g_uart_opus_read_idx + 1U) % OHOS_UART_OPUS_QUEUE_DEPTH;
+    g_uart_opus_queue_count--;
+    g_uart_opus_pop_count++;
+    LOS_IntRestore(intSave);
+
+    return len;
+}
+
+static VOID *UartLinkOpusPlayTask(UINT32 arg)
+{
+    (void)arg;
+
+    g_uart_opus_task_started = 1;
+    esp_rom_printf("[WS63-UART-OPUS] play task start prio=%u stack=0x%x queueDepth=%u maxFrame=%u maxSamples=%u\n",
+                   OHOS_UART_OPUS_PLAY_TASK_PRIO,
+                   OHOS_UART_OPUS_PLAY_TASK_STACK,
+                   OHOS_UART_OPUS_QUEUE_DEPTH,
+                   OHOS_OPUS_MAX_FRAME_BYTES,
+                   OHOS_OPUS_MAX_PCM_SAMPLES);
+
+    (void)OhosOpusDecoderInit();
+    (void)OhosAudioEs8311PortStartRealHw();
+
+    while (1) {
+        uint16_t opusLen;
+
+        if (g_uart_opus_sem_ready) {
+            (void)LOS_SemPend(g_uart_opus_sem, LOS_WAIT_FOREVER);
+        } else {
+            LOS_TaskDelay(1);
+        }
+
+        while ((opusLen = UartLinkOpusQueuePop(g_uart_opus_work_frame,
+                                               (uint16_t)sizeof(g_uart_opus_work_frame))) > 0U) {
+            uint16_t samples = 0;
+            uint32_t decodeSeq = (uint32_t)(g_uart_opus_pop_count + 1U);
+
+            if (decodeSeq <= 5U || (decodeSeq % 20U) == 0U) {
+                esp_rom_printf("[WS63-UART-OPUS] decode begin seq=%u len=%u q=%u drop=%u\n",
+                               decodeSeq,
+                               opusLen,
+                               g_uart_opus_queue_count,
+                               g_uart_opus_drop_count);
+            }
+
+            int32_t decRet = OhosOpusDecode(g_uart_opus_work_frame,
+                                            opusLen,
+                                            g_uart_opus_pcm,
+                                            OHOS_OPUS_MAX_PCM_SAMPLES,
+                                            &samples);
+            if (decRet != 0 || samples == 0U) {
+                g_uart_opus_decode_fail++;
+                esp_rom_printf("[WS63-UART-OPUS] decode fail len=%u ret=%ld q=%u ok=%u fail=%u\n",
+                               opusLen,
+                               (long)decRet,
+                               g_uart_opus_queue_count,
+                               g_uart_opus_decode_ok,
+                               g_uart_opus_decode_fail);
+                continue;
+            }
+
+            g_uart_opus_decode_ok++;
+            g_uart_opus_last_samples = samples;
+
+            uint32_t playRet = OhosAudioEs8311PortPlayPcm16Mono(g_uart_opus_pcm, samples);
+            if (playRet == 0U) {
+                g_uart_opus_play_ok++;
+            } else {
+                g_uart_opus_play_fail++;
+            }
+
+            if (playRet != 0U ||
+                g_uart_opus_pop_count <= 5U ||
+                (g_uart_opus_pop_count % 20U) == 0U ||
+                g_uart_opus_drop_count > 0U) {
+                esp_rom_printf("[WS63-UART-OPUS] frame done len=%u samples=%u playRet=%u q=%u pop=%u decOk=%u decFail=%u playOk=%u playFail=%u drop=%u\n",
+                               opusLen,
+                               samples,
+                               playRet,
+                               g_uart_opus_queue_count,
+                               g_uart_opus_pop_count,
+                               g_uart_opus_decode_ok,
+                               g_uart_opus_decode_fail,
+                               g_uart_opus_play_ok,
+                               g_uart_opus_play_fail,
+                               g_uart_opus_drop_count);
+            }
+        }
+    }
+
+    return NULL;
+}
+
+static void UartLinkOpusPlayStartTask(void)
+{
+    UINT32 semRet;
+    UINT32 taskRet;
+
+    if (!g_uart_opus_sem_ready) {
+        semRet = LOS_SemCreate(0, &g_uart_opus_sem);
+        g_uart_opus_sem_ready = (semRet == LOS_OK);
+        esp_rom_printf("[WS63-UART-OPUS] sem create ret=%u sem=%u ready=%u\n",
+                       semRet,
+                       g_uart_opus_sem,
+                       g_uart_opus_sem_ready);
+    }
+
+    if (g_uart_opus_play_task_id != 0U) {
+        return;
+    }
+
+    TSK_INIT_PARAM_S opusTask = {0};
+    opusTask.pfnTaskEntry = (TSK_ENTRY_FUNC)UartLinkOpusPlayTask;
+    opusTask.uwStackSize = OHOS_UART_OPUS_PLAY_TASK_STACK;
+    opusTask.usTaskPrio = OHOS_UART_OPUS_PLAY_TASK_PRIO;
+    opusTask.pcName = "ohos_opus_play";
+    taskRet = LOS_TaskCreate(&g_uart_opus_play_task_id, &opusTask);
+    esp_rom_printf("[WS63-UART-OPUS] play task create ret=%u taskId=%u prio=%u stack=0x%x\n",
+                   taskRet,
+                   g_uart_opus_play_task_id,
+                   OHOS_UART_OPUS_PLAY_TASK_PRIO,
+                   OHOS_UART_OPUS_PLAY_TASK_STACK);
+}
+
+static VOID *UartLinkUplinkOpusTask(UINT32 arg)
+{
+    (void)arg;
+
+    g_uart_up_opus_task_started = 1;
+    ESP_LOGI("WS63-UART-UP-OPUS",
+             "task start prio=%u stack=0x%x frameMs=%u pcmSamples=%u bitrate=%u targetBytes=%u",
+             OHOS_UART_UP_OPUS_TASK_PRIO,
+             OHOS_UART_UP_OPUS_TASK_STACK,
+             OHOS_OPUS_UPLINK_FRAME_MS,
+             OHOS_OPUS_UPLINK_PCM_SAMPLES,
+             OHOS_OPUS_UPLINK_BITRATE,
+             OHOS_OPUS_UPLINK_TARGET_BYTES);
+
+    while (1) {
+        uint16_t opusLen = 0;
+        int32_t encRet;
+        uint32_t readRet;
+        uint32_t txOk;
+        OhosAudioEs7210PcmFrameSnapshot pcmSnap;
+
+        if (g_uart_up_opus_stop_req || (!g_uart_up_opus_running && g_uart_up_opus_vad_session_active)) {
+            if (g_uart_up_opus_vad_session_active) {
+                uint32_t vadEndOk = UartLinkSendUplinkControlFrame(OHOS_UART_CMD_SET_FORCE_VAD_END,
+                                                                    "SET_FORCE_VAD_END");
+                if (vadEndOk) {
+                    g_uart_up_opus_vad_end_ok++;
+                    g_uart_up_opus_vad_session_active = 0;
+                } else {
+                    g_uart_up_opus_vad_end_fail++;
+                }
+            }
+            g_uart_up_opus_running = 0;
+            g_uart_up_opus_stop_req = 0;
+            ESP_LOGI("WS63-UART-UP-OPUS",
+                     "stop acknowledged stopCnt=%u txOk=%u txFail=%u encFail=%u pcmFail=%u vadS=%u/%u vadE=%u/%u",
+                     g_uart_up_opus_stop_count,
+                     g_uart_up_opus_tx_ok,
+                     g_uart_up_opus_tx_fail,
+                     g_uart_up_opus_encode_fail,
+                     g_uart_up_opus_pcm_fail,
+                     g_uart_up_opus_vad_start_ok,
+                     g_uart_up_opus_vad_start_fail,
+                     g_uart_up_opus_vad_end_ok,
+                     g_uart_up_opus_vad_end_fail);
+            continue;
+        }
+
+        if (!g_uart_up_opus_running) {
+            LOS_TaskDelay(5);
+            continue;
+        }
+
+        if (!g_uart_driver_init_ok || !g_uart_link_ready) {
+            g_uart_up_opus_last_ret = 0xfffffffdU;
+            if ((g_uart_up_opus_pcm_fail % 25U) == 0U) {
+                ESP_LOGI("WS63-UART-UP-OPUS",
+                         "wait link driver=%u linkReady=%u running=%u",
+                         g_uart_driver_init_ok,
+                         g_uart_link_ready,
+                         g_uart_up_opus_running);
+            }
+            g_uart_up_opus_pcm_fail++;
+            LOS_TaskDelay(10);
+            continue;
+        }
+
+        if (!g_uart_up_opus_vad_session_active) {
+            uint32_t vadStartOk = UartLinkSendUplinkControlFrame(OHOS_UART_CMD_SET_VAD_START,
+                                                                 "SET_VAD_START");
+            if (vadStartOk) {
+                g_uart_up_opus_vad_start_ok++;
+                g_uart_up_opus_vad_session_active = 1;
+            } else {
+                g_uart_up_opus_vad_start_fail++;
+                g_uart_up_opus_last_ret = 0xfffffff0U;
+                LOS_TaskDelay(10);
+                continue;
+            }
+        }
+
+        uint32_t frameStartMs = (uint32_t)esp_log_timestamp();
+
+        readRet = OhosAudioEs7210ReadPcm16MonoFrame(g_uart_up_opus_pcm,
+                                                    OHOS_OPUS_UPLINK_PCM_SAMPLES,
+                                                    120);
+        OhosAudioEs7210GetPcmFrameSnapshot(&pcmSnap);
+        g_uart_up_opus_last_peak = pcmSnap.peak;
+        g_uart_up_opus_last_nonzero = pcmSnap.nonzero;
+        g_uart_up_opus_last_samples = OHOS_OPUS_UPLINK_PCM_SAMPLES;
+
+        if (readRet != 0U) {
+            g_uart_up_opus_pcm_fail++;
+            g_uart_up_opus_last_ret = readRet;
+            LOS_TaskDelay(1);
+            continue;
+        }
+        if (!g_uart_up_opus_running || g_uart_up_opus_stop_req) {
+            continue;
+        }
+        g_uart_up_opus_pcm_ok++;
+
+        encRet = OhosOpusEncodePcm16Mono(g_uart_up_opus_pcm,
+                                         OHOS_OPUS_UPLINK_PCM_SAMPLES,
+                                         g_uart_up_opus_payload,
+                                         (uint16_t)sizeof(g_uart_up_opus_payload),
+                                         &opusLen);
+        if (encRet != 0 || opusLen == 0U) {
+            g_uart_up_opus_encode_fail++;
+            g_uart_up_opus_last_ret = (uint32_t)encRet;
+            LOS_TaskDelay(1);
+            continue;
+        }
+        if (!g_uart_up_opus_running || g_uart_up_opus_stop_req) {
+            continue;
+        }
+        g_uart_up_opus_encode_ok++;
+        g_uart_up_opus_last_len = opusLen;
+
+        txOk = UartLinkSendUplinkOpusFrame(g_uart_up_opus_payload, opusLen);
+        if (txOk) {
+            g_uart_up_opus_tx_ok++;
+        } else {
+            g_uart_up_opus_tx_fail++;
+        }
+
+        if (!txOk ||
+            g_uart_up_opus_tx_ok <= 5U ||
+            (g_uart_up_opus_tx_ok % 100U) == 0U ||
+            opusLen != OHOS_OPUS_UPLINK_TARGET_BYTES) {
+            ESP_LOGI("WS63-UART-UP-OPUS",
+                     "frame done pcmOk=%u pcmFail=%u encOk=%u encFail=%u txOk=%u txFail=%u opusLen=%u peak=%u nonzero=%u linkReady=%u",
+                     g_uart_up_opus_pcm_ok,
+                     g_uart_up_opus_pcm_fail,
+                     g_uart_up_opus_encode_ok,
+                     g_uart_up_opus_encode_fail,
+                     g_uart_up_opus_tx_ok,
+                     g_uart_up_opus_tx_fail,
+                     opusLen,
+                     g_uart_up_opus_last_peak,
+                     g_uart_up_opus_last_nonzero,
+                     g_uart_link_ready);
+        }
+
+        uint32_t frameElapsedMs = (uint32_t)(esp_log_timestamp() - frameStartMs);
+        if (frameElapsedMs < OHOS_OPUS_UPLINK_FRAME_MS) {
+            UartLinkUplinkOpusDelayStopAware(OHOS_OPUS_UPLINK_FRAME_MS - frameElapsedMs);
+        }
+    }
+
+    return NULL;
+}
+
+static void UartLinkUplinkOpusStartTask(void)
+{
+    if (g_uart_up_opus_task_started || g_uart_up_opus_task_id != 0U) {
+        return;
+    }
+
+    TSK_INIT_PARAM_S task = {0};
+    task.pfnTaskEntry = (TSK_ENTRY_FUNC)UartLinkUplinkOpusTask;
+    task.uwStackSize = OHOS_UART_UP_OPUS_TASK_STACK;
+    task.usTaskPrio = OHOS_UART_UP_OPUS_TASK_PRIO;
+    task.pcName = "ohos_up_opus";
+
+    uint32_t ret = LOS_TaskCreate(&g_uart_up_opus_task_id, &task);
+    esp_rom_printf("[WS63-UART-UP-OPUS] task create ret=%u taskId=%u prio=%u stack=0x%x\n",
+                   ret,
+                   g_uart_up_opus_task_id,
+                   OHOS_UART_UP_OPUS_TASK_PRIO,
+                   OHOS_UART_UP_OPUS_TASK_STACK);
+
+    if (ret != LOS_OK) {
+        g_uart_up_opus_task_id = 0;
+    }
+}
+
+static void UartLinkHandleDownAudioFrame(const OhosUartProtoFrame *frame)
+{
+    if (frame == NULL) {
+        return;
+    }
+
+    g_uart_down_audio_count++;
+    g_uart_down_audio_bytes += frame->payload_len;
+    g_uart_down_audio_last_len = frame->payload_len;
+
+    if (g_uart_down_audio_count <= 5U || (g_uart_down_audio_count % 20U) == 0U) {
+        esp_rom_printf("[WS63-UART-DOWN-AUDIO] count=%u cmd=0x%04x payloadLen=%u totalBytes=%u\n",
+                       g_uart_down_audio_count,
+                       frame->cmd_type,
+                       frame->payload_len,
+                       g_uart_down_audio_bytes);
+    }
+
+    if (g_uart_down_audio_count <= 3U) {
+        UartLinkDumpHex("[WS63-UART-DOWN-AUDIO-RAW]", frame->payload, frame->payload_len);
+    }
+
+    UartLinkHandleDownAudioPayload(frame->payload, frame->payload_len);
+}
+
+static void UartLinkHandleRxFrame(const OhosUartProtoFrame *frame)
+{
+    if (frame == NULL) {
+        return;
+    }
+
+    g_uart_rx_frame_count++;
+    g_uart_last_rx_cmd = frame->cmd_type;
+
+    if (frame->cmd_type == OHOS_UART_CMD_QUERY_SYSTEM_STATUS) {
+        esp_rom_printf("[OHOS-S47H] rx query cmd=0x%04x name=%s len=%u frameCnt=%u\n",
+                       frame->cmd_type,
+                       OhosUartProtoCmdName(frame->cmd_type),
+                       frame->payload_len,
+                       g_uart_rx_frame_count);
+        return;
+    }
+
+    if (frame->cmd_type == OHOS_UART_CMD_REPORT_SYSTEM_STATUS) {
+        uint32_t status = 0xFFFFFFFFU;
+
+        if (frame->payload_len > 0 && frame->payload != NULL) {
+            status = frame->payload[0];
+        }
+
+        g_uart_last_system_status = status;
+        g_uart_link_ready = (status == 0U);
+
+        esp_rom_printf("[OHOS-S47E] rx frame cmd=0x%04x name=%s len=%u status=%u linkReady=%u frameCnt=%u\n",
+                       frame->cmd_type,
+                       OhosUartProtoCmdName(frame->cmd_type),
+                       frame->payload_len,
+                       status,
+                       g_uart_link_ready,
+                       g_uart_rx_frame_count);
+        return;
+    }
+
+    if (frame->cmd_type == OHOS_UART_CMD_WIFI_SEND_SSID) {
+        UartLinkHandleStringData("WIFI_SEND_SSID",
+                                 g_uart_wifi_ssid,
+                                 OHOS_UART_SMALL_STRING_CAP,
+                                 &g_uart_wifi_ssid_len,
+                                 frame);
+        return;
+    }
+
+    if (frame->cmd_type == OHOS_UART_CMD_WIFI_SEND_PSWD) {
+        UartLinkHandleStringData("WIFI_SEND_PSWD",
+                                 g_uart_wifi_pswd,
+                                 OHOS_UART_SMALL_STRING_CAP,
+                                 &g_uart_wifi_pswd_len,
+                                 frame);
+        return;
+    }
+
+    if (frame->cmd_type == OHOS_UART_CMD_SET_WS_SERVER_URL) {
+        UartLinkHandleStringData("SET_WS_SERVER_URL",
+                                 g_uart_ws_url,
+                                 OHOS_UART_SMALL_STRING_CAP,
+                                 &g_uart_ws_url_len,
+                                 frame);
+        return;
+    }
+
+    if (frame->cmd_type == OHOS_UART_CMD_DOWN_TEXT_DATA) {
+        UartLinkHandleDownTextFrame(frame);
+        return;
+    }
+
+    if (frame->cmd_type == OHOS_UART_CMD_DOWN_AUDIO_DATA) {
+        UartLinkHandleDownAudioFrame(frame);
+        return;
+    }
+
+    esp_rom_printf("[OHOS-S47E] rx frame cmd=0x%04x name=%s len=%u frameCnt=%u\n",
+                   frame->cmd_type,
+                   OhosUartProtoCmdName(frame->cmd_type),
+                   frame->payload_len,
+                   g_uart_rx_frame_count);
+}
+
+static uint32_t UartLinkParseBufferedStream(uint8_t *stream, uint16_t *streamLen, const char *tag)
+{
+    uint32_t parsed = 0;
+
+    if (stream == NULL || streamLen == NULL) {
+        return 0;
+    }
+
+    while (*streamLen >= OHOS_UART_PROTO_FRAME_FIXED_LEN) {
+        uint16_t frameOffset = 0;
+        uint16_t frameLen = 0;
+        OhosUartProtoFrame frame;
+        int ret = OhosUartProtoFindFrame(stream,
+                                         *streamLen,
+                                         &frameOffset,
+                                         &frameLen,
+                                         &frame,
+                                         0);
+
+        if (ret == OHOS_UART_PROTO_OK) {
+            uint16_t consumeLen = (uint16_t)(frameOffset + frameLen);
+
+            esp_rom_printf("[%s] parse ok offset=%u frameLen=%u cmd=0x%04x name=%s payloadLen=%u\n",
+                           tag ? tag : "WS63-UART-PARSE",
+                           frameOffset,
+                           frameLen,
+                           frame.cmd_type,
+                           OhosUartProtoCmdName(frame.cmd_type),
+                           frame.payload_len);
+
+            UartLinkHandleRxFrame(&frame);
+            parsed++;
+
+            if (consumeLen < *streamLen) {
+                memmove(stream, &stream[consumeLen], *streamLen - consumeLen);
+                *streamLen = (uint16_t)(*streamLen - consumeLen);
+            } else {
+                *streamLen = 0;
+            }
+
+            continue;
+        }
+
+        if (ret == OHOS_UART_PROTO_ERR_SHORT) {
+            if (frameOffset > 0U && frameOffset < *streamLen) {
+                memmove(stream, &stream[frameOffset], *streamLen - frameOffset);
+                *streamLen = (uint16_t)(*streamLen - frameOffset);
+            }
+            break;
+        }
+
+        {
+            uint16_t keep = UartLinkKeepPartialHead(stream, *streamLen);
+            g_uart_rx_parse_fail_count++;
+            esp_rom_printf("[%s] failCnt=%u ret=%d streamLen=%u keep=%u\n",
+                           tag ? tag : "WS63-UART-PARSE",
+                           g_uart_rx_parse_fail_count,
+                           ret,
+                           *streamLen,
+                           keep);
+            UartLinkDumpHex("[WS63-UART-BUF]", stream, *streamLen);
+
+            if (keep > 0U) {
+                memmove(stream, &stream[*streamLen - keep], keep);
+            }
+            *streamLen = keep;
+        }
+        break;
+    }
+
+    return parsed;
+}
+
+#if OHOS_UART_LINK_ENABLE_LONG_FRAME_SELFTEST
+static uint32_t UartLinkSelftestFeedFrame(uint8_t *stream,
+                                          uint16_t *streamLen,
+                                          uint16_t cmdType,
+                                          const uint8_t *payload,
+                                          uint16_t payloadLen,
+                                          uint16_t chunk)
+{
+    uint8_t *frame = g_uart_selftest_frame;
+    uint16_t frameLen = 0;
+    uint16_t offset = 0;
+    uint32_t parsed = 0;
+    int ret;
+
+    ret = OhosUartProtoEncode(cmdType,
+                              payload,
+                              payloadLen,
+                              frame,
+                              (uint16_t)(OHOS_UART_PROTO_FRAME_FIXED_LEN + 384U),
+                              &frameLen,
+                              0);
+    if (ret != OHOS_UART_PROTO_OK) {
+        esp_rom_printf("[WS63-UART-LONG-SELFTEST] encode fail cmd=0x%04x payloadLen=%u ret=%d\n",
+                       cmdType,
+                       payloadLen,
+                       ret);
+        return 0;
+    }
+
+    while (offset < frameLen) {
+        uint16_t part = (uint16_t)(frameLen - offset);
+        if (part > chunk) {
+            part = chunk;
+        }
+
+        if ((uint32_t)(*streamLen + part) > OHOS_UART_RX_STREAM_CAP) {
+            esp_rom_printf("[WS63-UART-LONG-SELFTEST] stream overflow cmd=0x%04x streamLen=%u part=%u\n",
+                           cmdType,
+                           *streamLen,
+                           part);
+            *streamLen = 0;
+            return parsed;
+        }
+
+        memcpy(&stream[*streamLen], &frame[offset], part);
+        *streamLen = (uint16_t)(*streamLen + part);
+        parsed += UartLinkParseBufferedStream(stream, streamLen, "WS63-UART-LONG-SELFTEST");
+        offset = (uint16_t)(offset + part);
+    }
+
+    esp_rom_printf("[WS63-UART-LONG-SELFTEST] cmd=0x%04x name=%s payloadLen=%u frameLen=%u chunk=%u parsed=%u remain=%u\n",
+                   cmdType,
+                   OhosUartProtoCmdName(cmdType),
+                   payloadLen,
+                   frameLen,
+                   chunk,
+                   parsed,
+                   *streamLen);
+    return parsed;
+}
+
+static void UartLinkRunLongFrameSelfTest(void)
+{
+    static const uint8_t ws_url[] = {
+        'w', 's', ':', '/', '/', '1', '8', '3', '.', '9', '3', '.', '1', '4', '8', '.',
+        '6', ':', '8', '0', '0', '0', '/', 'x', 'i', 'a', 'o', 'h', 'o', 'n', 'g', '/',
+        'v', '1'
+    };
+    static const uint8_t down_text_payload[] = {
+        0x02, 0x4B, 0x01, 0x4F, 0x70, 0x65, 0x6E, 0x41, 0x49, 0xE6, 0x9C, 0x8D,
+        0xE5, 0x8A, 0xA1, 0xE5, 0x93, 0x8D, 0xE5, 0xBA, 0x94, 0xE5, 0xBC, 0x82,
+        0xE5, 0xB8, 0xB8, 0x3A, 0x20, 0x45, 0x72, 0x72, 0x6F, 0x72, 0x20, 0x63,
+        0x6F, 0x64, 0x65, 0x3A, 0x20, 0x34, 0x30, 0x30, 0x20, 0x2D, 0x20, 0x7B,
+        0x27, 0x65, 0x72, 0x72, 0x6F, 0x72, 0x27, 0x3A, 0x20, 0x7B, 0x27, 0x6D,
+        0x65, 0x73, 0x73, 0x61, 0x67, 0x65, 0x27, 0x3A, 0x20, 0x27, 0x41, 0x63,
+        0x63, 0x65, 0x73, 0x73, 0x20, 0x64, 0x65, 0x6E, 0x69, 0x65, 0x64, 0x2C,
+        0x20, 0x70, 0x6C, 0x65, 0x61, 0x73, 0x65, 0x20, 0x6D, 0x61, 0x6B, 0x65,
+        0x20, 0x73, 0x75, 0x72, 0x65, 0x20, 0x79, 0x6F, 0x75, 0x72, 0x20, 0x61,
+        0x63, 0x63, 0x6F, 0x75, 0x6E, 0x74, 0x20, 0x69, 0x73, 0x20, 0x69, 0x6E,
+        0x20, 0x67, 0x6F, 0x6F, 0x64, 0x20, 0x73, 0x74, 0x61, 0x6E, 0x64, 0x69,
+        0x6E, 0x67, 0x2E, 0x20, 0x46, 0x6F, 0x72, 0x20, 0x64, 0x65, 0x74, 0x61,
+        0x69, 0x6C, 0x73, 0x2C, 0x20, 0x73, 0x65, 0x65, 0x3A, 0x20, 0x68, 0x74,
+        0x74, 0x70, 0x73, 0x3A, 0x2F, 0x2F, 0x68, 0x65, 0x6C, 0x70, 0x2E, 0x61,
+        0x6C, 0x69, 0x79, 0x75, 0x6E, 0x2E, 0x63, 0x6F, 0x6D, 0x2F, 0x7A, 0x68,
+        0x2F, 0x6D, 0x6F, 0x64, 0x65, 0x6C, 0x2D, 0x73, 0x74, 0x75, 0x64, 0x69,
+        0x6F, 0x2F, 0x65, 0x72, 0x72, 0x6F, 0x72, 0x2D, 0x63, 0x6F, 0x64, 0x65,
+        0x23, 0x6F, 0x76, 0x65, 0x72, 0x64, 0x75, 0x65, 0x2D, 0x70, 0x61, 0x79,
+        0x6D, 0x65, 0x6E, 0x74, 0x27, 0x2C, 0x20, 0x27, 0x74, 0x79, 0x70, 0x65,
+        0x27, 0x3A, 0x20, 0x27, 0x41, 0x72, 0x72, 0x65, 0x61, 0x72, 0x61, 0x67,
+        0x65, 0x27, 0x2C, 0x20, 0x27, 0x70, 0x61, 0x72, 0x61, 0x6D, 0x27, 0x3A,
+        0x20, 0x4E, 0x6F, 0x6E, 0x65, 0x2C, 0x20, 0x27, 0x63, 0x6F, 0x64, 0x65,
+        0x27, 0x3A, 0x20, 0x27, 0x41, 0x72, 0x72, 0x65, 0x61, 0x72, 0x61, 0x67,
+        0x65, 0x27, 0x7D, 0x2C, 0x20, 0x27, 0x69, 0x64, 0x27, 0x3A, 0x20, 0x27,
+        0x63, 0x68, 0x61, 0x74, 0x63, 0x6D, 0x70, 0x6C, 0x2D, 0x38, 0x64, 0x32,
+        0x61, 0x34, 0x63, 0x65, 0x65, 0x2D, 0x65, 0x33, 0x31, 0x36, 0x2D, 0x39,
+        0x64, 0x36, 0x66, 0x2D, 0x39, 0x66, 0x61, 0x38, 0x2D, 0x35, 0x65, 0x39,
+        0x64, 0x39, 0x35, 0x34, 0x36, 0x66, 0x32, 0x65, 0x62, 0x27,
+    };
+    static const uint8_t opus_54[] = {
+        0x58, 0x43, 0x06, 0x1F, 0x4C, 0x54, 0x85, 0x36, 0x6D, 0x2A, 0xFA, 0xA9,
+        0xBE, 0x6C, 0xFA, 0x8F, 0x89, 0x1D, 0x60, 0x24, 0x09, 0x94, 0xBE, 0x73,
+        0xDD, 0x9F, 0x57, 0x9E, 0xE2, 0xDE, 0x07, 0xA9, 0xFE, 0x8B, 0x94, 0x50,
+        0x0D, 0x7D, 0xB6, 0x87, 0xB3, 0xB3, 0x5C, 0x44, 0x16, 0xA7, 0xAD, 0xFE,
+        0x77, 0x02, 0xA9, 0xB7, 0x9E, 0x02,
+    };
+    static const uint8_t opus_37[] = {
+        0x58, 0x02, 0x28, 0x3C, 0x8D, 0xBA, 0x8C, 0x5A, 0xA7, 0x18, 0x8B, 0x31,
+        0xFE, 0x54, 0x63, 0x17, 0x35, 0x1C, 0x07, 0xC4, 0x0F, 0x39, 0x85, 0x75,
+        0xBA, 0x6A, 0xDF, 0x12, 0x73, 0x67, 0xFE, 0xD8, 0x92, 0x06, 0x75, 0x9E,
+        0x58,
+    };
+    static const uint8_t opus_32[] = {
+        0x58, 0x02, 0x2B, 0x62, 0xEC, 0x96, 0xBE, 0x2B, 0xD9, 0x5F, 0x7B, 0x00,
+        0x80, 0xC9, 0xD0, 0xF5, 0x38, 0x7A, 0xE2, 0xE6, 0xFC, 0xE8, 0x0E, 0x3A,
+        0x0D, 0x18, 0x34, 0xAA, 0xA4, 0xBA, 0x7E, 0xF8,
+    };
+    static const uint8_t opus_40[] = {
+        0x58, 0x02, 0x28, 0x96, 0x01, 0x3B, 0x58, 0xB5, 0x27, 0xE5, 0x28, 0x54,
+        0x43, 0xB6, 0x9D, 0x87, 0x58, 0x71, 0x76, 0x20, 0x7E, 0x69, 0x6A, 0x28,
+        0x0F, 0x09, 0xAA, 0xF9, 0x2F, 0x07, 0xD2, 0x2B, 0xAE, 0x04, 0xAC, 0xE8,
+        0x1F, 0xF2, 0x03, 0xDB,
+    };
+    static const uint8_t opus_38[] = {
+        0x58, 0x02, 0x28, 0x97, 0x49, 0xA1, 0x3C, 0x9C, 0x91, 0x91, 0xA1, 0x62,
+        0xB9, 0x56, 0x68, 0x95, 0x7E, 0xC9, 0xFA, 0x2B, 0x15, 0x2D, 0x4A, 0xCC,
+        0xE6, 0xBC, 0xE9, 0xB0, 0xF7, 0x05, 0x9A, 0x26, 0x9B, 0xF2, 0x22, 0x99,
+        0x9D, 0x97,
+    };
+    static const uint8_t opus_41[] = {
+        0x58, 0x02, 0x65, 0x19, 0x85, 0xE4, 0x60, 0x88, 0xEC, 0x97, 0x59, 0xDA,
+        0xCE, 0x63, 0xF6, 0x10, 0xFA, 0x44, 0x66, 0x8C, 0x72, 0xA4, 0xA9, 0x03,
+        0xD0, 0xAC, 0xED, 0x8F, 0xC1, 0xC5, 0xB9, 0x51, 0x41, 0x87, 0x66, 0x49,
+        0xC2, 0xC3, 0x8C, 0x5C, 0x9F,
+    };
+    static const uint8_t opus_109[] = {
+        0x58, 0xE1, 0x84, 0x2C, 0xB6, 0x68, 0xE9, 0xBA, 0x31, 0xC5, 0x4A, 0xE7,
+        0x72, 0x15, 0x72, 0xE7, 0x49, 0xC1, 0x71, 0xE0, 0x6C, 0x13, 0x7A, 0x85,
+        0x03, 0xCE, 0xCD, 0x53, 0xE9, 0xB7, 0xC5, 0x90, 0x51, 0xF9, 0xC7, 0xBA,
+        0x16, 0xDE, 0x23, 0x05, 0xDB, 0x72, 0x5A, 0x17, 0x76, 0xC9, 0x6B, 0xEE,
+        0xBC, 0xF0, 0xF4, 0xA6, 0x68, 0x5B, 0xAC, 0x7C, 0x3D, 0x83, 0xD1, 0x2B,
+        0x8B, 0x87, 0x89, 0x07, 0x90, 0x1E, 0x46, 0x0C, 0x4C, 0x9A, 0xBD, 0x82,
+        0x0F, 0xBB, 0xF5, 0x16, 0x83, 0xFD, 0x45, 0x03, 0x51, 0x38, 0x7D, 0x96,
+        0x8A, 0x90, 0x74, 0x89, 0xE3, 0x80, 0xEF, 0x47, 0xB8, 0x0B, 0x97, 0x7A,
+        0x17, 0x49, 0x61, 0x85, 0xA2, 0xB5, 0x74, 0x47, 0x9B, 0x0F, 0xB6, 0x44,
+        0x37,
+    };
+    uint8_t *stream = g_uart_selftest_stream;
+    uint16_t streamLen = 0;
+    uint32_t baseFail = g_uart_rx_parse_fail_count;
+    uint32_t baseText = g_uart_down_text_count;
+    uint32_t baseAudio = g_uart_down_audio_count;
+    uint32_t parsed = 0;
+    uint32_t ok;
+
+    parsed += UartLinkSelftestFeedFrame(stream, &streamLen, OHOS_UART_CMD_SET_WS_SERVER_URL,
+                                        ws_url, (uint16_t)sizeof(ws_url), 31U);
+    parsed += UartLinkSelftestFeedFrame(stream, &streamLen, OHOS_UART_CMD_DOWN_TEXT_DATA,
+                                        down_text_payload, (uint16_t)sizeof(down_text_payload), 31U);
+    parsed += UartLinkSelftestFeedFrame(stream, &streamLen, OHOS_UART_CMD_DOWN_AUDIO_DATA,
+                                        opus_54, (uint16_t)sizeof(opus_54), 31U);
+    parsed += UartLinkSelftestFeedFrame(stream, &streamLen, OHOS_UART_CMD_DOWN_AUDIO_DATA,
+                                        opus_37, (uint16_t)sizeof(opus_37), 31U);
+    parsed += UartLinkSelftestFeedFrame(stream, &streamLen, OHOS_UART_CMD_DOWN_AUDIO_DATA,
+                                        opus_32, (uint16_t)sizeof(opus_32), 31U);
+    parsed += UartLinkSelftestFeedFrame(stream, &streamLen, OHOS_UART_CMD_DOWN_AUDIO_DATA,
+                                        opus_40, (uint16_t)sizeof(opus_40), 31U);
+    parsed += UartLinkSelftestFeedFrame(stream, &streamLen, OHOS_UART_CMD_DOWN_AUDIO_DATA,
+                                        opus_38, (uint16_t)sizeof(opus_38), 31U);
+    parsed += UartLinkSelftestFeedFrame(stream, &streamLen, OHOS_UART_CMD_DOWN_AUDIO_DATA,
+                                        opus_41, (uint16_t)sizeof(opus_41), 31U);
+    parsed += UartLinkSelftestFeedFrame(stream, &streamLen, OHOS_UART_CMD_DOWN_AUDIO_DATA,
+                                        opus_109, (uint16_t)sizeof(opus_109), 31U);
+
+    ok = (streamLen == 0U &&
+          g_uart_rx_parse_fail_count == baseFail &&
+          g_uart_down_text_count == baseText + 1U &&
+          g_uart_down_text_type == OHOS_UART_TEXT_TYPE_TTS &&
+          g_uart_down_text_len == 331U &&
+          g_uart_down_audio_count == baseAudio + 7U);
+
+    esp_rom_printf("[WS63-UART-LONG-SELFTEST] final ok=%u parsed=%u remain=%u parseFailDelta=%u textType=%u textLen=%u audioFramesDelta=%u wsUrlLen=%u\n",
+                   ok,
+                   parsed,
+                   streamLen,
+                   g_uart_rx_parse_fail_count - baseFail,
+                   g_uart_down_text_type,
+                   g_uart_down_text_len,
+                   g_uart_down_audio_count - baseAudio,
+                   g_uart_ws_url_len);
+}
+#else
+static void UartLinkRunLongFrameSelfTest(void)
+{
+    esp_rom_printf("[WS63-UART-LONG-SELFTEST] disabled\n");
+}
+#endif
+
+static VOID *OhosUartLinkServiceRxTask(UINT32 arg)
+{
+    (void)arg;
+
+    uint8_t *stream = g_uart_rx_stream;
+    uint16_t streamLen = 0;
+
+    uint32_t ready = OhosServiceWaitReady(&g_uart_service_init_count,
+                                          &g_uart_service_identity,
+                                          500);
+
+    if (!ready || !g_uart_driver_init_ok) {
+        esp_rom_printf("[OHOS-S47E] UartLinkService rx task wait ready=%u driverInit=%u, continue polling\n",
+                       ready,
+                       g_uart_driver_init_ok);
+    }
+
+    while (!g_uart_driver_init_ok) {
+        LOS_TaskDelay(10);
+    }
+
+    g_uart_rx_task_started = 1;
+
+    esp_rom_printf("[OHOS-S47E] UartLinkService rx task entered uart=%d cap=%u\n",
+                   OHOS_UART_LINK_PORT,
+                   OHOS_UART_RX_STREAM_CAP);
+
+    UartLinkRunLongFrameSelfTest();
+
+    while (1) {
+        int readLen;
+        uint16_t freeLen;
+
+        if (streamLen >= OHOS_UART_RX_STREAM_CAP) {
+            streamLen = 0;
+        }
+
+        freeLen = (uint16_t)(OHOS_UART_RX_STREAM_CAP - streamLen);
+        readLen = uart_read_bytes(OHOS_UART_LINK_PORT,
+                                  &stream[streamLen],
+                                  freeLen,
+                                  20);
+
+        if (readLen > 0) {
+            g_uart_rx_raw_count++;
+            g_uart_rx_raw_bytes += (uint32_t)readLen;
+
+            esp_rom_printf("[WS63-UART-RX] cnt=%u readLen=%d totalBytes=%u oldStreamLen=%u\n",
+                           g_uart_rx_raw_count,
+                           readLen,
+                           g_uart_rx_raw_bytes,
+                           streamLen);
+            UartLinkDumpHex("[WS63-UART-RX-RAW]", &stream[streamLen], (uint16_t)readLen);
+
+            streamLen = (uint16_t)(streamLen + (uint16_t)readLen);
+
+            (void)UartLinkParseBufferedStream(stream, &streamLen, "WS63-UART-PARSE");
+        } else {
+            LOS_TaskDelay(1);
+        }
+    }
+
+    return NULL;
+}
+
+static BOOL UartLinkServiceInitialize(Service *service, Identity identity)
+{
+    (void)service;
+
+    g_uart_service_init_count++;
+    g_uart_service_identity = identity;
+    g_uart_service_queue_ok = (identity.queueId != NULL);
+
+    uint32_t initOk = UartLinkDriverInit();
+
+    esp_rom_printf("[OHOS-S46A] UartLinkService init count=%u serviceId=%d featureId=%d queue=%p queueOk=%u driverInit=%u\n",
+                   g_uart_service_init_count,
+                   identity.serviceId,
+                   identity.featureId,
+                   identity.queueId,
+                   g_uart_service_queue_ok,
+                   initOk);
+
+    return TRUE;
+}
+
+static BOOL UartLinkServiceMessageHandle(Service *service, Request *request)
+{
+    (void)service;
+
+    g_uart_service_msg_count++;
+
+    BOOL reqOk = FALSE;
+    int msgId = request ? request->msgId : -1;
+    uint32_t cmd = request ? request->msgValue : 0xffffffffU;
+
+    if (request != NULL) {
+        if (request->msgId == OHOS_SERVICE_MSG_UART_GET_STATUS &&
+            request->msgValue == OHOS_SERVICE_CMD_GET_STATUS) {
+            g_uart_service_status_ok = g_uart_driver_init_ok;
+            reqOk = TRUE;
+        } else if (request->msgId == OHOS_SERVICE_MSG_UART_SELF_TEST &&
+                   request->msgValue == OHOS_SERVICE_CMD_SELF_TEST) {
+            g_uart_service_selftest_ok = UartLinkLoopbackTest();
+            reqOk = TRUE;
+        } else if (request->msgId == OHOS_SERVICE_MSG_UART_SEND) {
+            g_uart_service_send_msg_ok = UartLinkLoopbackTest();
+            reqOk = TRUE;
+        }
+    }
+
+    esp_rom_printf("[OHOS-S46A] UartLinkService message count=%u req=%p msgId=%d cmd=%u reqOk=%u statusOk=%u selfTestOk=%u sendMsgOk=%u driverInit=%u loopOk=%u\n",
+                   g_uart_service_msg_count,
+                   request,
+                   msgId,
+                   cmd,
+                   reqOk,
+                   g_uart_service_status_ok,
+                   g_uart_service_selftest_ok,
+                   g_uart_service_send_msg_ok,
+                   g_uart_driver_init_ok,
+                   g_uart_loopback_ok);
+
+    return TRUE;
+}
+
+static TaskConfig UartLinkServiceGetTaskConfig(Service *service)
+{
+    (void)service;
+
+    TaskConfig config = {
+        .level = LEVEL_HIGH,
+        .priority = PRI_NORMAL,
+        .stackSize = 0x1000,
+        .queueSize = 8,
+        .taskFlags = SINGLE_TASK,
+    };
+
+    return config;
+}
+
+static Service g_uart_link_service = {
+    .GetName = UartLinkServiceGetName,
+    .Initialize = UartLinkServiceInitialize,
+    .MessageHandle = UartLinkServiceMessageHandle,
+    .GetTaskConfig = UartLinkServiceGetTaskConfig,
+};
+
+static int32 UartLinkServiceSendRequest(int16 msgId, uint32_t cmd)
+{
+    return OhosServiceSendSimpleRequest(&g_uart_service_identity, msgId, cmd);
+}
+
+static VOID *OhosUartLinkServiceVerifyTask(UINT32 arg)
+{
+    (void)arg;
+
+    for (int i = 0; i < 200; ++i) {
+        if (g_uart_service_init_count > 0 && g_uart_service_identity.queueId != NULL) {
+            break;
+        }
+        LOS_TaskDelay(1);
+    }
+
+    BOOL initOk = (g_uart_service_init_count > 0);
+    BOOL queueOk = (g_uart_service_identity.queueId != NULL);
+
+    int32 statusRet = EC_FAILURE;
+    int32 selfTestRet = EC_FAILURE;
+    int32 sendRet = EC_FAILURE;
+
+    if (initOk && queueOk) {
+        statusRet = UartLinkServiceSendRequest(OHOS_SERVICE_MSG_UART_GET_STATUS,
+                                               OHOS_SERVICE_CMD_GET_STATUS);
+        LOS_TaskDelay(20);
+
+        selfTestRet = UartLinkServiceSendRequest(OHOS_SERVICE_MSG_UART_SELF_TEST,
+                                                 OHOS_SERVICE_CMD_SELF_TEST);
+        LOS_TaskDelay(20);
+
+        sendRet = UartLinkServiceSendRequest(OHOS_SERVICE_MSG_UART_SEND,
+                                             OHOS_SERVICE_CMD_START);
+    }
+
+    g_uart_service_send_ok = (statusRet == EC_SUCCESS &&
+                              selfTestRet == EC_SUCCESS &&
+                              sendRet == EC_SUCCESS);
+
+    esp_rom_printf("[OHOS-S46A] UartLinkService send status=%d selfTest=%d send=%d sendOk=%u initOk=%u queueOk=%u\n",
+                   statusRet,
+                   selfTestRet,
+                   sendRet,
+                   g_uart_service_send_ok,
+                   initOk,
+                   queueOk);
+
+    for (int i = 0; i < 200; ++i) {
+        if (g_uart_service_msg_count >= 3 &&
+            g_uart_service_status_ok &&
+            g_uart_service_selftest_ok &&
+            g_uart_service_send_msg_ok) {
+            break;
+        }
+        LOS_TaskDelay(1);
+    }
+
+    BOOL msgOk = (g_uart_service_msg_count >= 3 &&
+                  g_uart_service_status_ok &&
+                  g_uart_service_selftest_ok &&
+                  g_uart_service_send_msg_ok);
+
+    BOOL ok = (initOk &&
+               queueOk &&
+               g_uart_service_send_ok &&
+               msgOk &&
+               g_uart_driver_init_ok &&
+               g_uart_loopback_ok);
+
+    esp_rom_printf("[OHOS-S46A] UartLinkService verify init=%u queue=%u send=%u msg=%u msgCnt=%u status=%u selfTest=%u sendMsg=%u driverInit=%u loopOk=%u ok=%u\n",
+                   initOk,
+                   queueOk,
+                   g_uart_service_send_ok,
+                   msgOk,
+                   g_uart_service_msg_count,
+                   g_uart_service_status_ok,
+                   g_uart_service_selftest_ok,
+                   g_uart_service_send_msg_ok,
+                   g_uart_driver_init_ok,
+                   g_uart_loopback_ok,
+                   ok);
+
+    return NULL;
+}
+
+
+
+uint32_t OhosUartLinkServiceLegacySelfTest(void)
+{
+    uint32_t ready = OhosServiceWaitReady(&g_uart_service_init_count,
+                                          &g_uart_service_identity,
+                                          200);
+    uint32_t baseMsgCnt = g_uart_service_msg_count;
+
+    int32 statusRet = EC_FAILURE;
+    int32 selfTestRet = EC_FAILURE;
+    int32 sendRet = EC_FAILURE;
+
+    if (ready) {
+        statusRet = UartLinkServiceSendRequest(OHOS_SERVICE_MSG_UART_GET_STATUS,
+                                               OHOS_SERVICE_CMD_GET_STATUS);
+        LOS_TaskDelay(20);
+
+        selfTestRet = UartLinkServiceSendRequest(OHOS_SERVICE_MSG_UART_SELF_TEST,
+                                                 OHOS_SERVICE_CMD_SELF_TEST);
+        LOS_TaskDelay(20);
+
+        sendRet = UartLinkServiceSendRequest(OHOS_SERVICE_MSG_UART_SEND,
+                                             OHOS_SERVICE_CMD_START);
+    }
+
+    for (int i = 0; i < 200; ++i) {
+        if (g_uart_service_msg_count >= baseMsgCnt + 3 &&
+            g_uart_loopback_ok) {
+            break;
+        }
+        LOS_TaskDelay(1);
+    }
+
+    uint32_t msgOk = (g_uart_service_msg_count >= baseMsgCnt + 3);
+    uint32_t sendOk = (statusRet == EC_SUCCESS &&
+                       selfTestRet == EC_SUCCESS &&
+                       sendRet == EC_SUCCESS);
+    uint32_t ok = (ready && sendOk && msgOk && g_uart_driver_init_ok && g_uart_loopback_ok);
+
+    esp_rom_printf("[OHOS-S46A] UartLinkService selftest ready=%u send=%u msg=%u driverInit=%u loopOk=%u base=%u now=%u ok=%u\n",
+                   ready,
+                   sendOk,
+                   msgOk,
+                   g_uart_driver_init_ok,
+                   g_uart_loopback_ok,
+                   baseMsgCnt,
+                   g_uart_service_msg_count,
+                   ok);
+
+    return ok ? LOS_OK : 1U;
+}
+
+
+
+
+static uint32_t UartLinkSendProtocolFrame(uint16_t cmdType,
+                                          const uint8_t *payload,
+                                          uint16_t payloadLen,
+                                          const char *tag)
+{
+    uint8_t *frame = g_uart_tx_frame;
+    uint16_t frameLen = 0;
+    int encodeRet;
+    int writeRet;
+    uint32_t ok;
+
+    if (payloadLen > OHOS_UART_PROTO_MAX_PAYLOAD_LEN) {
+        esp_rom_printf("[OHOS-S47H] tx frame tag=%s cmd=0x%04x payload too large len=%u\n",
+                       tag ? tag : "null",
+                       cmdType,
+                       payloadLen);
+        return 0;
+    }
+
+    encodeRet = OhosUartProtoEncode(cmdType,
+                                    payload,
+                                    payloadLen,
+                                    frame,
+                                    OHOS_UART_PROTO_MAX_FRAME_LEN,
+                                    &frameLen,
+                                    0);
+
+    if (encodeRet != OHOS_UART_PROTO_OK) {
+        esp_rom_printf("[OHOS-S47H] tx frame tag=%s cmd=0x%04x encodeRet=%d ok=0\n",
+                       tag ? tag : "null",
+                       cmdType,
+                       encodeRet);
+        return 0;
+    }
+
+    writeRet = uart_write_bytes(OHOS_UART_LINK_PORT, frame, frameLen);
+    ok = (writeRet == (int)frameLen);
+    g_uart_diag_tx_count++;
+
+    esp_rom_printf("[WS63-UART-TX] cnt=%u tag=%s cmd=0x%04x name=%s payloadLen=%u frameLen=%u writeRet=%d ok=%u\n",
+                   g_uart_diag_tx_count,
+                   tag ? tag : "null",
+                   cmdType,
+                   OhosUartProtoCmdName(cmdType),
+                   payloadLen,
+                   frameLen,
+                   writeRet,
+                   ok);
+    UartLinkDumpHex("[WS63-UART-TX-RAW]", frame, frameLen);
+
+    esp_rom_printf("[OHOS-S47H] tx frame tag=%s cmd=0x%04x name=%s payloadLen=%u frameLen=%u writeRet=%d ok=%u\n",
+                   tag ? tag : "null",
+                   cmdType,
+                   OhosUartProtoCmdName(cmdType),
+                   payloadLen,
+                   frameLen,
+                   writeRet,
+                   ok);
+
+    return ok;
+}
+
+static uint32_t UartLinkSendUplinkOpusFrame(const uint8_t *payload, uint16_t payloadLen)
+{
+    uint16_t frameLen = 0;
+    int encodeRet;
+    int writeRet;
+    uint32_t ok;
+
+    encodeRet = OhosUartProtoEncode(OHOS_UART_CMD_UP_AUDIO_DATA,
+                                    payload,
+                                    payloadLen,
+                                    g_uart_up_opus_tx_frame,
+                                    (uint16_t)sizeof(g_uart_up_opus_tx_frame),
+                                    &frameLen,
+                                    0);
+    if (encodeRet != OHOS_UART_PROTO_OK) {
+        g_uart_up_opus_last_ret = (uint32_t)encodeRet;
+        ESP_LOGW("WS63-UART-UP-OPUS",
+                 "encode frame fail opusLen=%u ret=%d",
+                 payloadLen,
+                 encodeRet);
+        return 0;
+    }
+
+    writeRet = uart_write_bytes(OHOS_UART_LINK_PORT, g_uart_up_opus_tx_frame, frameLen);
+    ok = (writeRet == (int)frameLen);
+    g_uart_up_opus_last_ret = (uint32_t)writeRet;
+    if (ok) {
+        g_uart_diag_tx_count++;
+    }
+
+    if (!ok ||
+        g_uart_up_opus_tx_ok < 3U ||
+        ((g_uart_up_opus_tx_ok + g_uart_up_opus_tx_fail) % 100U) == 0U) {
+        ESP_LOGI("WS63-UART-UP-OPUS",
+                 "tx cmd=0x%04x payloadLen=%u frameLen=%u writeRet=%d ok=%u txOk=%u txFail=%u linkReady=%u",
+                 OHOS_UART_CMD_UP_AUDIO_DATA,
+                 payloadLen,
+                 frameLen,
+                 writeRet,
+                 ok,
+                 g_uart_up_opus_tx_ok,
+                 g_uart_up_opus_tx_fail,
+                 g_uart_link_ready);
+    }
+
+    return ok;
+}
+
+static uint32_t UartLinkSendUplinkControlFrame(uint16_t cmdType, const char *tag)
+{
+    uint16_t frameLen = 0;
+    int encodeRet;
+    int writeRet;
+    uint32_t ok;
+
+    encodeRet = OhosUartProtoEncode(cmdType,
+                                    NULL,
+                                    0,
+                                    g_uart_up_opus_tx_frame,
+                                    (uint16_t)sizeof(g_uart_up_opus_tx_frame),
+                                    &frameLen,
+                                    0);
+    if (encodeRet != OHOS_UART_PROTO_OK) {
+        g_uart_up_opus_last_ret = (uint32_t)encodeRet;
+        ESP_LOGW("WS63-UART-UP-OPUS",
+                 "control encode fail tag=%s cmd=0x%04x ret=%d",
+                 tag ? tag : "null",
+                 cmdType,
+                 encodeRet);
+        return 0;
+    }
+
+    writeRet = uart_write_bytes(OHOS_UART_LINK_PORT, g_uart_up_opus_tx_frame, frameLen);
+    ok = (writeRet == (int)frameLen);
+    g_uart_up_opus_last_ret = (uint32_t)writeRet;
+    if (ok) {
+        g_uart_diag_tx_count++;
+    }
+
+    ESP_LOGI("WS63-UART-UP-OPUS",
+             "control tx tag=%s cmd=0x%04x name=%s frameLen=%u writeRet=%d ok=%u linkReady=%u",
+             tag ? tag : "null",
+             cmdType,
+             OhosUartProtoCmdName(cmdType),
+             frameLen,
+             writeRet,
+             ok,
+             g_uart_link_ready);
+
+    return ok;
+}
+
+
+static uint32_t UartLinkSendRawPattern(const char *tag, const uint8_t *data, uint16_t len)
+{
+    int writeRet;
+    uint32_t ok;
+
+    if (data == NULL || len == 0U) {
+        esp_rom_printf("[WS63-UART-TX-PATTERN] tag=%s invalid data len=%u\n",
+                       tag ? tag : "null",
+                       len);
+        return 0;
+    }
+
+    writeRet = uart_write_bytes(OHOS_UART_LINK_PORT, data, len);
+    ok = (writeRet == (int)len);
+
+    esp_rom_printf("[WS63-UART-TX-PATTERN] tag=%s len=%u writeRet=%d ok=%u\n",
+                   tag ? tag : "null",
+                   len,
+                   writeRet,
+                   ok);
+    UartLinkDumpHex("[WS63-UART-TX-PATTERN-RAW]", data, len);
+
+    return ok;
+}
+
+static void UartLinkSyncStrongDiag(void)
+{
+    uint8_t *stream = g_uart_sync_stream;
+    uint16_t streamLen = 0;
+    const uint32_t syncRounds = 5U;
+    const uint32_t pollPerRound = 10U;
+
+    esp_rom_printf("[WS63-UART-SYNC] begin driverInit=%u port=%d baud=%u TX=GPIO30 RX=GPIO31 rounds=%u\n",
+                   g_uart_driver_init_ok,
+                   OHOS_UART_LINK_PORT,
+                   (uint32_t)OHOS_UART_LINK_BAUDRATE,
+                   syncRounds);
+
+    if (!g_uart_driver_init_ok) {
+        uint32_t forceInitOk;
+
+        esp_rom_printf("[WS63-UART-SYNC] driver not init by samgr task, force init inside UartLinkServiceStartTasks\n");
+
+        forceInitOk = UartLinkDriverInit();
+
+        esp_rom_printf("[WS63-UART-SYNC] force driver init ret=%u driverInit=%u\n",
+                       forceInitOk,
+                       g_uart_driver_init_ok);
+    }
+
+    if (!g_uart_driver_init_ok) {
+        esp_rom_printf("[WS63-UART-SYNC] skip: driver still not init\n");
+        return;
+    }
+
+    uart_flush_input(OHOS_UART_LINK_PORT);
+
+    for (uint32_t i = 0; i < syncRounds; ++i) {
+        static const uint8_t pattern55[16] = {
+            0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55,
+            0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55
+        };
+        static const uint8_t patternAA[16] = {
+            0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA,
+            0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA
+        };
+        static const uint8_t asciiTest[] = "P4_TX_TEST_115200\\r\\n";
+
+        UartLinkSendRawPattern("PATTERN_55_X16", pattern55, sizeof(pattern55));
+        UartLinkSendRawPattern("PATTERN_AA_X16", patternAA, sizeof(patternAA));
+        UartLinkSendRawPattern("ASCII_P4_TX_TEST", asciiTest, (uint16_t)(sizeof(asciiTest) - 1U));
+
+        uint32_t txOk = UartLinkSendProtocolFrame(OHOS_UART_CMD_QUERY_SYSTEM_STATUS,
+                                                  NULL,
+                                                  0,
+                                                  "SYNC_QUERY_SYSTEM_STATUS");
+
+        g_uart_query_tx_count++;
+        if (txOk) {
+            g_uart_query_tx_ok++;
+        }
+
+        esp_rom_printf("[WS63-UART-SYNC] round=%u txOk=%u queryCnt=%u queryOk=%u linkReady=%u\n",
+                       i + 1,
+                       txOk,
+                       g_uart_query_tx_count,
+                       g_uart_query_tx_ok,
+                       g_uart_link_ready);
+
+        for (uint32_t poll = 0; poll < pollPerRound; ++poll) {
+            int readLen;
+            uint16_t freeLen;
+
+            if (streamLen >= OHOS_UART_RX_STREAM_CAP) {
+                streamLen = 0;
+            }
+
+            freeLen = (uint16_t)(OHOS_UART_RX_STREAM_CAP - streamLen);
+            readLen = uart_read_bytes(OHOS_UART_LINK_PORT,
+                                      &stream[streamLen],
+                                      freeLen,
+                                      20);
+
+            if (readLen <= 0) {
+                continue;
+            }
+
+            g_uart_rx_raw_count++;
+            g_uart_rx_raw_bytes += (uint32_t)readLen;
+
+            esp_rom_printf("[WS63-UART-SYNC-RX] round=%u poll=%u readLen=%d totalBytes=%u oldStreamLen=%u\n",
+                           i + 1,
+                           poll + 1,
+                           readLen,
+                           g_uart_rx_raw_bytes,
+                           streamLen);
+            UartLinkDumpHex("[WS63-UART-SYNC-RX-RAW]", &stream[streamLen], (uint16_t)readLen);
+
+            streamLen = (uint16_t)(streamLen + (uint16_t)readLen);
+
+            (void)UartLinkParseBufferedStream(stream, &streamLen, "WS63-UART-SYNC-PARSE");
+        }
+
+        esp_rom_printf("[WS63-UART-SYNC] round=%u done rxRawCnt=%u rxBytes=%u parseFail=%u linkReady=%u lastCmd=0x%04x status=%u\n",
+                       i + 1,
+                       g_uart_rx_raw_count,
+                       g_uart_rx_raw_bytes,
+                       g_uart_rx_parse_fail_count,
+                       g_uart_link_ready,
+                       g_uart_last_rx_cmd,
+                       g_uart_last_system_status);
+    }
+
+    esp_rom_printf("[WS63-UART-SYNC] final queryCnt=%u queryOk=%u txCnt=%u rxRawCnt=%u rxBytes=%u parseFail=%u linkReady=%u lastCmd=0x%04x status=%u\n",
+                   g_uart_query_tx_count,
+                   g_uart_query_tx_ok,
+                   g_uart_diag_tx_count,
+                   g_uart_rx_raw_count,
+                   g_uart_rx_raw_bytes,
+                   g_uart_rx_parse_fail_count,
+                   g_uart_link_ready,
+                   g_uart_last_rx_cmd,
+                   g_uart_last_system_status);
+}
+
+
+static VOID *OhosUartLinkServiceHandshakeTask(UINT32 arg)
+{
+    (void)arg;
+
+    const uint32_t diagRetry = 60U;
+    uint32_t ready = OhosServiceWaitReady(&g_uart_service_init_count,
+                                          &g_uart_service_identity,
+                                          500);
+
+    if (!ready) {
+        esp_rom_printf("[OHOS-S47H] handshake task wait service ready failed\n");
+    }
+
+    while (!g_uart_driver_init_ok || !g_uart_rx_task_started) {
+        LOS_TaskDelay(10);
+    }
+
+    g_uart_handshake_task_started = 1;
+
+    esp_rom_printf("[OHOS-S47H] handshake task entered retry=%u linkReady=%u\n",
+                   diagRetry,
+                   g_uart_link_ready);
+
+    for (uint32_t i = 0; i < diagRetry; ++i) {
+        uint32_t txOk;
+
+        if (g_uart_link_ready) {
+            break;
+        }
+
+        txOk = UartLinkSendProtocolFrame(OHOS_UART_CMD_QUERY_SYSTEM_STATUS,
+                                         NULL,
+                                         0,
+                                         "QUERY_SYSTEM_STATUS");
+
+        g_uart_query_tx_count++;
+        if (txOk) {
+            g_uart_query_tx_ok++;
+        }
+
+        esp_rom_printf("[OHOS-S47H] handshake query attempt=%u txOk=%u queryCnt=%u queryOk=%u linkReady=%u\n",
+                       i + 1,
+                       txOk,
+                       g_uart_query_tx_count,
+                       g_uart_query_tx_ok,
+                       g_uart_link_ready);
+
+        for (uint32_t wait = 0; wait < OHOS_UART_HANDSHAKE_WAIT_TICKS; ++wait) {
+            if (g_uart_link_ready) {
+                break;
+            }
+            LOS_TaskDelay(5);
+        }
+    }
+
+    g_uart_handshake_task_done = 1;
+
+    esp_rom_printf("[WS63-UART-DIAG] handshake final queryCnt=%u queryOk=%u txCnt=%u rxRawCnt=%u rxBytes=%u parseFail=%u linkReady=%u lastCmd=0x%04x status=%u\n",
+                   g_uart_query_tx_count,
+                   g_uart_query_tx_ok,
+                   g_uart_diag_tx_count,
+                   g_uart_rx_raw_count,
+                   g_uart_rx_raw_bytes,
+                   g_uart_rx_parse_fail_count,
+                   g_uart_link_ready,
+                   g_uart_last_rx_cmd,
+                   g_uart_last_system_status);
+
+    esp_rom_printf("[OHOS-S47H] handshake task done queryCnt=%u queryOk=%u linkReady=%u lastCmd=0x%04x status=%u\n",
+                   g_uart_query_tx_count,
+                   g_uart_query_tx_ok,
+                   g_uart_link_ready,
+                   g_uart_last_rx_cmd,
+                   g_uart_last_system_status);
+
+    return NULL;
+}
+
+
+static uint32_t UartLinkProtocolLoopbackTest(void)
+{
+#if OHOS_UART_LINK_ENABLE_PROTOCOL_LOOPBACK_SELFTEST
+    uint8_t payload[1] = {0};
+    uint8_t frame[OHOS_UART_PROTO_FRAME_FIXED_LEN + 1U];
+    uint16_t frameLen = 0;
+    int encodeRet;
+    int writeRet;
+    uint32_t baseFrameCnt;
+    uint32_t ready = 0;
+    uint32_t ok;
+
+    for (int i = 0; i < 100; ++i) {
+        if (g_uart_driver_init_ok && g_uart_rx_task_started) {
+            ready = 1;
+            break;
+        }
+        LOS_TaskDelay(1);
+    }
+
+    encodeRet = OhosUartProtoEncode(OHOS_UART_CMD_REPORT_SYSTEM_STATUS,
+                                    payload,
+                                    1,
+                                    frame,
+                                    sizeof(frame),
+                                    &frameLen,
+                                    0);
+
+    if (encodeRet != OHOS_UART_PROTO_OK) {
+        esp_rom_printf("[OHOS-S47F] protocol loopback encode failed ret=%d\n", encodeRet);
+        return 0;
+    }
+
+    baseFrameCnt = g_uart_rx_frame_count;
+    g_uart_link_ready = 0;
+    g_uart_last_rx_cmd = 0;
+    g_uart_last_system_status = 0xFFFFFFFFU;
+
+    uart_flush_input(OHOS_UART_LINK_PORT);
+
+    writeRet = uart_write_bytes(OHOS_UART_LINK_PORT, frame, frameLen);
+
+    for (int i = 0; i < 200; ++i) {
+        if (g_uart_rx_frame_count > baseFrameCnt &&
+            g_uart_last_rx_cmd == OHOS_UART_CMD_REPORT_SYSTEM_STATUS &&
+            g_uart_link_ready) {
+            break;
+        }
+        LOS_TaskDelay(1);
+    }
+
+    ok = (ready &&
+          writeRet == (int)frameLen &&
+          g_uart_rx_frame_count > baseFrameCnt &&
+          g_uart_last_rx_cmd == OHOS_UART_CMD_REPORT_SYSTEM_STATUS &&
+          g_uart_last_system_status == 0U &&
+          g_uart_link_ready);
+
+    esp_rom_printf("[OHOS-S47F] UartLinkService protocol loopback ready=%u tx=%d frameLen=%u base=%u now=%u lastCmd=0x%04x status=%u linkReady=%u ok=%u\n",
+                   ready,
+                   writeRet,
+                   frameLen,
+                   baseFrameCnt,
+                   g_uart_rx_frame_count,
+                   g_uart_last_rx_cmd,
+                   g_uart_last_system_status,
+                   g_uart_link_ready,
+                   ok);
+
+    return ok;
+#else
+    esp_rom_printf("[OHOS-S47G] UartLinkService protocol loopback skipped by config\n");
+    return 1U;
+#endif
+}
+
+
+uint32_t OhosUartLinkServiceSelfTest(void)
+{
+    int protoRet = OhosUartProtoSelfTest();
+    int protoOk = (protoRet == OHOS_UART_PROTO_OK);
+    uint32_t loopOk;
+
+#if OHOS_UART_LINK_ENABLE_REAL_WS63_MODE
+    loopOk = 1U;
+    esp_rom_printf("[OHOS-S47I] real WS63 mode enabled, local protocol loopback is skipped\n");
+#else
+    loopOk = UartLinkProtocolLoopbackTest();
+#endif
+
+    uint32_t ok = (protoOk && loopOk);
+
+    esp_rom_printf("[OHOS-S47I] UartLinkService link mode realWs63=%u localLoopback=%u baud=%u protoRet=%d protoOk=%d loopOk=%u linkReady=%u queryCnt=%u queryOk=%u ok=%u\n",
+                   (uint32_t)OHOS_UART_LINK_ENABLE_REAL_WS63_MODE,
+                   (uint32_t)OHOS_UART_LINK_ENABLE_PROTOCOL_LOOPBACK_SELFTEST,
+                   (uint32_t)OHOS_UART_LINK_BAUDRATE,
+                   protoRet,
+                   protoOk,
+                   loopOk,
+                   g_uart_link_ready,
+                   g_uart_query_tx_count,
+                   g_uart_query_tx_ok,
+                   ok);
+
+    return ok ? 0 : 1;
+}
+
+
+
+uint32_t OhosUartLinkServiceRegister(void)
+{
+    SamgrLite *samgr = SAMGR_GetInstance();
+
+    if (samgr == NULL) {
+        esp_rom_printf("[OHOS-S46A] UartLinkService register failed: samgr null\n");
+        return 1U;
+    }
+
+    BOOL regOk = samgr->RegisterService(&g_uart_link_service);
+
+    esp_rom_printf("[OHOS-S46A] UartLinkService register regOk=%u\n", regOk);
+
+    return (regOk == TRUE) ? LOS_OK : 2U;
+}
+
+uint32_t OhosUartLinkServiceStartTasks(void)
+{
+    int protoSelfRet = OhosUartProtoSelfTest();
+    esp_rom_printf("[OHOS-S47B] UartLinkService proto selftest ret=%d ok=%d\n",
+                   protoSelfRet, protoSelfRet == OHOS_UART_PROTO_OK);
+
+    if (!g_uart_driver_init_ok) {
+        uint32_t initOk = UartLinkDriverInit();
+        esp_rom_printf("[P4-UART-CLK] force init in StartTasks ret=%u driverInit=%u\n",
+                       initOk,
+                       g_uart_driver_init_ok);
+    }
+
+    UartLinkOpusPlayStartTask();
+    UartLinkUplinkOpusStartTask();
+
+    TSK_INIT_PARAM_S rxTask = {0};
+    rxTask.pfnTaskEntry = (TSK_ENTRY_FUNC)OhosUartLinkServiceRxTask;
+    rxTask.uwStackSize = OHOS_UART_RX_TASK_STACK;
+    rxTask.usTaskPrio = OHOS_UART_RX_TASK_PRIO;
+    rxTask.pcName = "ohos_uart_rx";
+    uint32_t rxRet = LOS_TaskCreate(&g_uart_rx_task_id, &rxTask);
+    esp_rom_printf("[OHOS-S47E] UartLinkService rx task create ret=%u taskId=%u prio=%u stack=0x%x\n",
+                   rxRet,
+                   g_uart_rx_task_id,
+                   OHOS_UART_RX_TASK_PRIO,
+                   OHOS_UART_RX_TASK_STACK);
+
+    TSK_INIT_PARAM_S handshakeTask = {0};
+    handshakeTask.pfnTaskEntry = (TSK_ENTRY_FUNC)OhosUartLinkServiceHandshakeTask;
+    handshakeTask.uwStackSize = OHOS_UART_HANDSHAKE_TASK_STACK;
+    handshakeTask.usTaskPrio = OHOS_UART_HANDSHAKE_TASK_PRIO;
+    handshakeTask.pcName = "ohos_uart_hs";
+    uint32_t hsRet = LOS_TaskCreate(&g_uart_handshake_task_id, &handshakeTask);
+    esp_rom_printf("[OHOS-S47H] UartLinkService handshake task create ret=%u taskId=%u prio=%u stack=0x%x\n",
+                   hsRet,
+                   g_uart_handshake_task_id,
+                   OHOS_UART_HANDSHAKE_TASK_PRIO,
+                   OHOS_UART_HANDSHAKE_TASK_STACK);
+
+    esp_rom_printf("[WS63-UART-SYNC] skipped for audio voice loopback test\n");
+
+    esp_rom_printf("[OHOS-S46A] UartLinkService standalone verify task skipped, unified selftest will run\n");
+    return LOS_OK;
+}
+
+uint32_t OhosUartLinkServiceStart(void)
+{
+    uint32_t ret = OhosUartLinkServiceRegister();
+
+    if (ret != LOS_OK) {
+        return ret;
+    }
+
+    SAMGR_Bootstrap();
+
+    ret = OhosUartLinkServiceStartTasks();
+
+    return ret;
+}
+
+/*
+ * S69C:
+ * Public UI API for Demo Center WS63 UART Test page.
+ * Keep the existing UartLinkService RX task and protocol parser unchanged.
+ */
+uint32_t OhosUartLinkUiSendQuery(void)
+{
+    if (!g_uart_driver_init_ok) {
+        uint32_t initOk = UartLinkDriverInit();
+        esp_rom_printf("[S69C-WS63-UI] force driver init ret=%u driverInit=%u\n",
+                       initOk,
+                       g_uart_driver_init_ok);
+    }
+
+    if (!g_uart_driver_init_ok) {
+        esp_rom_printf("[S69C-WS63-UI] send query skipped: driver not init\n");
+        return 0;
+    }
+
+    uint32_t txOk = UartLinkSendProtocolFrame(OHOS_UART_CMD_QUERY_SYSTEM_STATUS,
+                                              NULL,
+                                              0,
+                                              "UI_QUERY_SYSTEM_STATUS");
+    g_uart_query_tx_count++;
+    if (txOk) {
+        g_uart_query_tx_ok++;
+    }
+
+    esp_rom_printf("[S69C-WS63-UI] send query txOk=%u queryCnt=%u queryOk=%u linkReady=%u\n",
+                   txOk,
+                   g_uart_query_tx_count,
+                   g_uart_query_tx_ok,
+                   g_uart_link_ready);
+
+    return txOk;
+}
+
+uint32_t OhosUartLinkUiSendReportOk(void)
+{
+    uint8_t payload[1] = {0};
+
+    if (!g_uart_driver_init_ok) {
+        uint32_t initOk = UartLinkDriverInit();
+        esp_rom_printf("[S69C-WS63-UI] force driver init ret=%u driverInit=%u\n",
+                       initOk,
+                       g_uart_driver_init_ok);
+    }
+
+    if (!g_uart_driver_init_ok) {
+        esp_rom_printf("[S69C-WS63-UI] send report skipped: driver not init\n");
+        return 0;
+    }
+
+    uint32_t txOk = UartLinkSendProtocolFrame(OHOS_UART_CMD_REPORT_SYSTEM_STATUS,
+                                              payload,
+                                              sizeof(payload),
+                                              "UI_REPORT_SYSTEM_STATUS_OK");
+
+    esp_rom_printf("[S69C-WS63-UI] send report-ok txOk=%u linkReady=%u lastCmd=0x%04x status=%u\n",
+                   txOk,
+                   g_uart_link_ready,
+                   g_uart_last_rx_cmd,
+                   g_uart_last_system_status);
+
+    return txOk;
+}
+
+uint32_t OhosUartLinkUiStartUplinkOpusTest(void)
+{
+    if (!g_uart_driver_init_ok) {
+        uint32_t initOk = UartLinkDriverInit();
+        esp_rom_printf("[S69C-WS63-UI] uplink opus force driver init ret=%u driverInit=%u\n",
+                       initOk,
+                       g_uart_driver_init_ok);
+    }
+
+    UartLinkUplinkOpusStartTask();
+
+    if (!g_uart_driver_init_ok || !g_uart_link_ready || g_uart_up_opus_task_id == 0U) {
+        esp_rom_printf("[S69C-WS63-UI] uplink opus start skipped driver=%u linkReady=%u taskId=%u\n",
+                       g_uart_driver_init_ok,
+                       g_uart_link_ready,
+                       g_uart_up_opus_task_id);
+        return 0;
+    }
+
+    int32_t encInitRet = OhosOpusEncoderInit();
+    if (encInitRet != 0) {
+        esp_rom_printf("[S69C-WS63-UI] uplink opus start encoder init fail ret=%ld\n",
+                       (long)encInitRet);
+        return 0;
+    }
+
+    g_uart_up_opus_stop_req = 0;
+    g_uart_up_opus_running = 1;
+    g_uart_up_opus_start_count++;
+
+    esp_rom_printf("[S69C-WS63-UI] uplink opus start ok startCnt=%u frameMs=%u pcmSamples=%u targetBytes=%u linkReady=%u\n",
+                   g_uart_up_opus_start_count,
+                   OHOS_OPUS_UPLINK_FRAME_MS,
+                   OHOS_OPUS_UPLINK_PCM_SAMPLES,
+                   OHOS_OPUS_UPLINK_TARGET_BYTES,
+                   g_uart_link_ready);
+    return 1;
+}
+
+uint32_t OhosUartLinkUiStopUplinkOpusTest(void)
+{
+    if (!g_uart_up_opus_running) {
+        esp_rom_printf("[S69C-WS63-UI] uplink opus stop skipped: not running\n");
+        return 1;
+    }
+
+    g_uart_up_opus_stop_req = 1;
+    g_uart_up_opus_stop_count++;
+    esp_rom_printf("[S69C-WS63-UI] uplink opus stop requested stopCnt=%u txOk=%u txFail=%u encOk=%u encFail=%u\n",
+                   g_uart_up_opus_stop_count,
+                   g_uart_up_opus_tx_ok,
+                   g_uart_up_opus_tx_fail,
+                   g_uart_up_opus_encode_ok,
+                   g_uart_up_opus_encode_fail);
+    return 1;
+}
+
+void OhosUartLinkUiGetSnapshot(OhosUartLinkUiSnapshot *snap)
+{
+    if (snap == NULL) {
+        return;
+    }
+
+    snap->driver_init_ok = g_uart_driver_init_ok;
+    snap->rx_task_started = g_uart_rx_task_started;
+    snap->handshake_started = g_uart_handshake_task_started;
+    snap->handshake_done = g_uart_handshake_task_done;
+    snap->link_ready = g_uart_link_ready;
+
+    snap->tx_count = g_uart_diag_tx_count;
+    snap->query_tx_count = g_uart_query_tx_count;
+    snap->query_tx_ok = g_uart_query_tx_ok;
+
+    snap->rx_frame_count = g_uart_rx_frame_count;
+    snap->rx_raw_count = g_uart_rx_raw_count;
+    snap->rx_raw_bytes = g_uart_rx_raw_bytes;
+    snap->rx_parse_fail_count = g_uart_rx_parse_fail_count;
+
+    snap->last_rx_cmd = g_uart_last_rx_cmd;
+    snap->last_system_status = g_uart_last_system_status;
+    snap->last_write_ret = g_uart_write_ret;
+    snap->last_read_ret = g_uart_read_ret;
+
+    snap->ws_url_len = g_uart_ws_url_len;
+    snap->wifi_ssid_len = g_uart_wifi_ssid_len;
+    snap->wifi_pswd_len = g_uart_wifi_pswd_len;
+    snap->down_text_count = g_uart_down_text_count;
+    snap->down_text_type = g_uart_down_text_type;
+    snap->down_text_len = g_uart_down_text_len;
+    snap->down_audio_count = g_uart_down_audio_count;
+    snap->down_audio_bytes = g_uart_down_audio_bytes;
+    snap->down_audio_last_len = g_uart_down_audio_last_len;
+    snap->opus_queue_count = g_uart_opus_queue_count;
+    snap->opus_queue_drops = g_uart_opus_drop_count;
+    snap->opus_decode_ok = g_uart_opus_decode_ok;
+    snap->opus_decode_fail = g_uart_opus_decode_fail;
+    snap->opus_play_ok = g_uart_opus_play_ok;
+    snap->opus_play_fail = g_uart_opus_play_fail;
+    snap->opus_last_samples = g_uart_opus_last_samples;
+    snap->opus_task_started = g_uart_opus_task_started;
+    snap->up_opus_task_started = g_uart_up_opus_task_started;
+    snap->up_opus_running = g_uart_up_opus_running;
+    snap->up_opus_start_count = g_uart_up_opus_start_count;
+    snap->up_opus_stop_count = g_uart_up_opus_stop_count;
+    snap->up_opus_pcm_ok = g_uart_up_opus_pcm_ok;
+    snap->up_opus_pcm_fail = g_uart_up_opus_pcm_fail;
+    snap->up_opus_encode_ok = g_uart_up_opus_encode_ok;
+    snap->up_opus_encode_fail = g_uart_up_opus_encode_fail;
+    snap->up_opus_tx_ok = g_uart_up_opus_tx_ok;
+    snap->up_opus_tx_fail = g_uart_up_opus_tx_fail;
+    snap->up_opus_last_len = g_uart_up_opus_last_len;
+    snap->up_opus_last_samples = g_uart_up_opus_last_samples;
+    snap->up_opus_last_peak = g_uart_up_opus_last_peak;
+    snap->up_opus_last_nonzero = g_uart_up_opus_last_nonzero;
+    snap->up_opus_last_ret = g_uart_up_opus_last_ret;
+    snap->up_opus_vad_start_ok = g_uart_up_opus_vad_start_ok;
+    snap->up_opus_vad_start_fail = g_uart_up_opus_vad_start_fail;
+    snap->up_opus_vad_end_ok = g_uart_up_opus_vad_end_ok;
+    snap->up_opus_vad_end_fail = g_uart_up_opus_vad_end_fail;
+}
+
+void OhosUartLinkUiGetDownText(char *buf, uint32_t bufLen)
+{
+    if (buf == NULL || bufLen == 0U) {
+        return;
+    }
+
+    UartLinkSafeCopyText(buf,
+                         (uint16_t)bufLen,
+                         (const uint8_t *)g_uart_down_text,
+                         (uint16_t)strlen(g_uart_down_text));
+}
+
+const char *OhosUartLinkUiCmdName(uint32_t cmd)
+{
+    return OhosUartProtoCmdName((uint16_t)cmd);
+}
