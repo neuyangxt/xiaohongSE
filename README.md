@@ -49,7 +49,7 @@ text
 |---|---|---|---|---|
 | **Hub板** | WS63 + ESP32-P4 | 480x800触摸屏 | — | — |
 | **温湿度模组** | WS63 | SHT30 (I2C) | `XH_TH` | `...:01` |
-| **风扇模组** | WS63 | GPIO9/10/11 + 按键GPIO5 | `XH_FAN | `...:03` |
+| **风扇模组** | WS63 | GPIO9/10/11 + 按键GPIO5 | `XH_FAN`| `...:03` |
 | **人体感应模组** | WS63 | LD2401 (GPIO9) | `XH_HUMAN` | `...:05` |
 | **照明模组** | WS63 | WS2812 (GPIO9) + 按键GPIO5 | `XH_LIGHT` | `...:07` |
 
@@ -106,7 +106,7 @@ text
 | idf.py | — | ESP-IDF编译工具 |
 
 ### 编译命令
-```bash
+
 # 编译WS63固件
 cd /root/xiaohongSE2
 hb build -f
@@ -117,6 +117,7 @@ idf.py build
 
 # 烧录ESP32-P4
 idf.py -p COM5 flash
+
 
 
 ## 七、通信协议扩展
@@ -139,8 +140,8 @@ GitHub仓库：https://github.com/neuyangxt/xiaohongSE
 
 AtomGit仓库：（待补充）
 
-九、开源协议
+## 九、开源协议
 本项目仅供学习交流使用。
 
-十、致谢
+## 十、致谢
 感谢王莹老师的指导，感谢小鸿SE实践教程提供的星闪开发框架和示例代码。
