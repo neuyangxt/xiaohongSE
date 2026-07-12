@@ -1,0 +1,225 @@
+# Host-specific paths are provided by environment variables.
+# Before building, run:
+#   export OHOS_ROOT=/path/to/OpenHarmony
+#   source /path/to/esp-idf/export.sh
+if(NOT DEFINED ENV{OHOS_ROOT})
+    message(FATAL_ERROR "OHOS_ROOT is not set. Please export OHOS_ROOT=/path/to/OpenHarmony")
+endif()
+set(OHOS_ROOT "$ENV{OHOS_ROOT}")
+
+if(NOT DEFINED ENV{IDF_PATH})
+    message(FATAL_ERROR "IDF_PATH is not set. Please source ESP-IDF export.sh or run get_idf")
+endif()
+set(IDF_ROOT "$ENV{IDF_PATH}")
+
+set(OHOS_LITEOS_LOCAL_SRCS
+    "${OHOS_ROOT}/kernel/liteos_m/kernel/src/mm/los_memory.c"
+    "ohos_liteos_bridge.c"
+    "ohos_p4_tick_isr.S"
+    "ohos_stdio_wrap.c"
+    "lib/ohos_liteos_port_shims.c"
+    "lib/los_task_no_pm.c"
+    "services/demo_service.c"
+    "services/led_service.c"
+    "services/key_service.c"
+    "services/uart_link_service.c"
+    "services/device_identity_service.c"
+    "services/config_service.c"
+    "services/font_service.c"
+    "services/p4_ui_model.c"
+    "services/ohos_opus_codec.c"
+    "services/display_service.c"
+    "services/audio_service.c"
+    "services/voice_command_service.c"
+    "services/camera_service.c"
+    "services/common/ohos_service_common.c"
+    "services/common/ohos_uart_protocol.c"
+    "services/common/p4_sensor_xh_tlv.c"
+    "hw/ohos_mainline_multimedia_display.c"
+    "hw/camera_capture_probe.c"
+    "hw/osptek_app_video.c"
+    "hw/lvgl_demo_ui.c"
+    "hw/assets/spin_frames.c"
+    "hw/audio/ohos_audio_es8311_port.c"
+    "hw/audio/ohos_audio_es7210_port.c"
+    "hw/board/ohos_board_i2c.c"
+    "hw/touch/ohos_touch_st7123_probe.c"
+    "hw/font/lv_font_stream_bin.c"
+    "hw/font/lvgl_lfs_font.c"
+    "hw/font/p4_system_font_cn_16.c"
+    "hw/font/p4_system_font.c"
+    "ui/p4_status_bar.c"
+    "ui/p4_text_view.c"
+    "ui/p4_dialog_page.c"
+    "ui/p4_desktop_page.c"
+    "ui/p4_sensor_page.c"
+    "hw/storage/ohos_lfs_port.c"
+    "hw/storage/ohos_norflash_port.c"
+)
+
+set(OHOS_SAMGR_SRCS
+    "${OHOS_ROOT}/foundation/systemabilitymgr/samgr_lite/samgr/source/common.c"
+    "${OHOS_ROOT}/foundation/systemabilitymgr/samgr_lite/samgr/source/iunknown.c"
+    "${OHOS_ROOT}/foundation/systemabilitymgr/samgr_lite/samgr/source/feature.c"
+    "${OHOS_ROOT}/foundation/systemabilitymgr/samgr_lite/samgr/source/service.c"
+    "${OHOS_ROOT}/foundation/systemabilitymgr/samgr_lite/samgr/source/message.c"
+    "${OHOS_ROOT}/foundation/systemabilitymgr/samgr_lite/samgr/source/task_manager.c"
+    "${OHOS_ROOT}/foundation/systemabilitymgr/samgr_lite/samgr/registry/service_registry.c"
+    "${OHOS_ROOT}/foundation/systemabilitymgr/samgr_lite/samgr/source/samgr_lite.c"
+)
+
+idf_component_register(
+    SRCS
+        ${OHOS_LITEOS_LOCAL_SRCS}
+        ${OHOS_SAMGR_SRCS}
+    INCLUDE_DIRS
+        "include"
+        "services/include"
+        "hw"
+        "hw/assets"
+        "hw/audio"
+        "hw/board"
+        "hw/font"
+        "hw/storage"
+        "ui"
+    REQUIRES
+        esp_driver_gptimer
+        esp_driver_gpio
+        esp_driver_uart
+        esp_driver_i2s
+        esp_driver_i2c
+        esp_driver_isp
+        esp_driver_cam
+        esp_driver_jpeg
+        esp_lcd
+        esp_driver_ppa
+        esp_psram
+        esp_timer
+        esp_rom
+        soc
+        hal
+        esp_hw_support
+        bootloader_support
+        spi_flash
+        esp_security
+        esp_mm
+        json
+        mbedtls
+        lvgl__lvgl
+        esp_lvgl_adapter
+        esp_lcd_st7102
+        hw_init
+        espressif__esp_lcd_ek79007
+        espressif__esp_lcd_ili9881c
+        espressif__esp_lcd_st7703
+        espressif__esp_video
+        espressif__esp_cam_sensor
+        espressif__esp_sccb_intf
+        espressif__esp_ipa
+        espressif__es8311
+        joltwallet__littlefs
+        78__esp-opus
+        espressif__esp-sr
+    bsp_extra
+    waveshare__esp32_p4_wifi6_touch_lcd_xc
+    esp_codec_dev
+    espressif__esp_lcd_touch_st7123
+    EMBED_FILES
+        "hw/audio/canon.pcm"
+        "hw/font/test_font_1.fnt"
+)
+
+set(OHOS_BOARD_INCLUDES
+    "${OHOS_ROOT}/device/board/alientek/dnesp32p4/liteos_m/board"
+    "${OHOS_ROOT}/device/board/alientek/dnesp32p4/liteos_m/board/include"
+)
+
+set(OHOS_KERNEL_INCLUDES
+    "${OHOS_ROOT}/kernel/liteos_m/kernel/include"
+    "${OHOS_ROOT}/kernel/liteos_m/utils"
+    "${OHOS_ROOT}/kernel/liteos_m/arch/include"
+    "${OHOS_ROOT}/kernel/liteos_m/arch/risc-v/riscv32/gcc"
+    "${OHOS_ROOT}/kernel/liteos_m/arch/risc-v/common"
+    "${OHOS_ROOT}/kernel/liteos_m/arch/risc-v/riscv32/gcc/asm"
+)
+
+set(OHOS_SUBSYSTEM_INCLUDES
+    "${OHOS_ROOT}/commonlibrary/utils_lite/include"
+    "${OHOS_ROOT}/base/hiviewdfx/hilog_lite/interfaces/native/kits"
+    "${OHOS_ROOT}/base/hiviewdfx/hilog_lite/interfaces/native/kits/hilog_lite"
+    "${OHOS_ROOT}/foundation/systemabilitymgr/samgr_lite/interfaces/kits/samgr"
+    "${OHOS_ROOT}/foundation/systemabilitymgr/samgr_lite/interfaces/kits/registry"
+    "${OHOS_ROOT}/foundation/systemabilitymgr/samgr_lite/samgr/adapter"
+    "${OHOS_ROOT}/foundation/systemabilitymgr/samgr_lite/samgr/source"
+    "${OHOS_ROOT}/foundation/systemabilitymgr/samgr_lite/samgr/registry"
+    "${OHOS_ROOT}/third_party/bounds_checking_function/include"
+)
+
+set(IDF_EXTRA_INCLUDES
+    "${IDF_ROOT}/components/soc/include"
+    "${IDF_ROOT}/components/soc/esp32p4/include"
+    "${IDF_ROOT}/components/hal/include"
+    "${IDF_ROOT}/components/hal/esp32p4/include"
+    "${IDF_ROOT}/components/esp_rom/include"
+    "${IDF_ROOT}/components/esp_rom/esp32p4/include"
+    "${IDF_ROOT}/components/esp_hw_support/include"
+    "${IDF_ROOT}/components/esp_common/include"
+)
+
+target_include_directories(${COMPONENT_LIB} PRIVATE
+    ${OHOS_BOARD_INCLUDES}
+    ${OHOS_KERNEL_INCLUDES}
+    ${OHOS_SUBSYSTEM_INCLUDES}
+    ${IDF_EXTRA_INCLUDES}
+)
+
+add_prebuilt_library(openharmony_liteos_m
+    "${CMAKE_CURRENT_LIST_DIR}/lib/libopenharmony_liteos_m.a"
+)
+
+target_link_libraries(${COMPONENT_LIB} PUBLIC
+    openharmony_liteos_m
+)
+
+target_link_libraries(${COMPONENT_LIB} PRIVATE
+    idf::esp_timer
+)
+
+target_compile_definitions(${COMPONENT_LIB} PUBLIC
+    OHOS_LITEOS_ENABLE_START=1
+)
+
+target_compile_definitions(${COMPONENT_LIB} PRIVATE
+    LOSCFG_SYS_HEAP_SIZE=0x20000UL
+    LOSCFG_BASE_CORE_TSK_IDLE_STACK_SIZE=0x2000UL
+    SHARED_TASK_STACK_SIZE=0x800U
+    OHOS_ENABLE_P4_SENSOR_XH_TLV=1
+    OHOS_ENABLE_BRINGUP_SMOKE=0
+    OHOS_ENABLE_KERNEL_CONTINUOUS_SMOKE=0
+    OHOS_ENABLE_SAMGR_RUNTIME_VERIFY=0
+    OHOS_ENABLE_DEMO_SERVICE=0
+    OHOS_ENABLE_MULTI_SERVICE_RUNTIME=1
+    OHOS_ENABLE_MULTI_SERVICE_SELFTEST=1
+    OHOS_ENABLE_DISPLAY_SERVICE=1
+    OHOS_ENABLE_AUDIO_SERVICE=1
+    OHOS_ENABLE_CAMERA_SERVICE=1
+    OHOS_ENABLE_CONFIG_SERVICE=1
+    OHOS_ENABLE_FONT_SERVICE=1
+    OHOS_ENABLE_P4_DIALOG_UI=1
+    OHOS_ENABLE_P4_DESKTOP_UI=1
+    OHOS_ENABLE_P4_SENSOR_UI=1
+    OHOS_ENABLE_LED_SERVICE=0
+    OHOS_ENABLE_KEY_SERVICE=0
+    OHOS_ENABLE_UART_LINK_SERVICE=1
+    OHOS_DISABLE_IDLE_PM_ENTER=1
+)
+
+target_link_options(${COMPONENT_LIB} INTERFACE
+    "-Wl,--wrap=printf"
+    "-Wl,--wrap=vprintf"
+    "-Wl,--wrap=fprintf"
+    "-Wl,--wrap=vfprintf"
+    "-Wl,--wrap=_vfprintf_r"
+    "-Wl,--wrap=puts"
+    "-Wl,--wrap=_puts_r"
+)

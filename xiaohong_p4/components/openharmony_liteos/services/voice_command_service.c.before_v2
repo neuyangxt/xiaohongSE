@@ -1,0 +1,265 @@
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "esp_err.h"
+#include "esp_heap_caps.h"
+#include "esp_log.h"
+#include "esp_mn_iface.h"
+#include "esp_mn_models.h"
+#include "esp_mn_speech_commands.h"
+#include "model_path.h"
+
+#include "los_task.h"
+#include "ohos_liteos_media_task.h"
+#include "ohos_audio_es7210_port.h"
+#include "ohos_uart_link_ui.h"
+#include "ohos_uart_protocol.h"
+#include "voice_command_service.h"
+
+#ifndef LOS_OK
+#define LOS_OK 0U
+#endif
+
+#define VOICE_COMMAND_TASK_PRIO          21U
+#define VOICE_COMMAND_TASK_STACK         0x7000U
+#define VOICE_COMMAND_RING_SAMPLES       16000U
+#define VOICE_COMMAND_MODEL_TIMEOUT_MS   6000
+#define VOICE_COMMAND_COOLDOWN_MS        1500U
+
+#define VOICE_COMMAND_ALARM_ON           1
+#define VOICE_COMMAND_ALARM_OFF          2
+
+static const char *TAG = "p4_voice_command";
+
+static volatile uint32_t g_voice_task_started;
+static int16_t *g_voice_ring;
+static volatile uint32_t g_voice_ring_read;
+static volatile uint32_t g_voice_ring_write;
+static volatile uint32_t g_voice_ring_count;
+static volatile uint32_t g_voice_ring_drop;
+static volatile uint32_t g_voice_detect_count;
+
+static srmodel_list_t *g_voice_models;
+static const esp_mn_iface_t *g_voice_multinet;
+static model_iface_data_t *g_voice_model_data;
+
+static void VoiceCommandRingReset(void)
+{
+    uint32_t intSave = LOS_IntLock();
+    g_voice_ring_read = 0;
+    g_voice_ring_write = 0;
+    g_voice_ring_count = 0;
+    LOS_IntRestore(intSave);
+}
+
+static void VoiceCommandPcmTap(const int16_t *pcm, uint32_t samples, void *userData)
+{
+    (void)userData;
+
+    if (pcm == NULL || samples == 0U || g_voice_ring == NULL) {
+        return;
+    }
+
+    uint32_t intSave = LOS_IntLock();
+    for (uint32_t i = 0; i < samples; ++i) {
+        if (g_voice_ring_count >= VOICE_COMMAND_RING_SAMPLES) {
+            g_voice_ring_read = (g_voice_ring_read + 1U) % VOICE_COMMAND_RING_SAMPLES;
+            g_voice_ring_count--;
+            g_voice_ring_drop++;
+        }
+        g_voice_ring[g_voice_ring_write] = pcm[i];
+        g_voice_ring_write = (g_voice_ring_write + 1U) % VOICE_COMMAND_RING_SAMPLES;
+        g_voice_ring_count++;
+    }
+    LOS_IntRestore(intSave);
+}
+
+static uint32_t VoiceCommandRingRead(int16_t *out, uint32_t samples)
+{
+    uint32_t copied = 0;
+
+    if (out == NULL || samples == 0U || g_voice_ring == NULL) {
+        return 0;
+    }
+
+    uint32_t intSave = LOS_IntLock();
+    while (copied < samples && g_voice_ring_count > 0U) {
+        out[copied++] = g_voice_ring[g_voice_ring_read];
+        g_voice_ring_read = (g_voice_ring_read + 1U) % VOICE_COMMAND_RING_SAMPLES;
+        g_voice_ring_count--;
+    }
+    LOS_IntRestore(intSave);
+    return copied;
+}
+
+static uint32_t VoiceCommandConfigureModel(void)
+{
+    char *modelName;
+    esp_err_t ret;
+
+    g_voice_models = esp_srmodel_init("model");
+    if (g_voice_models == NULL) {
+        ESP_LOGE(TAG, "model partition init failed");
+        return 1U;
+    }
+
+    modelName = esp_srmodel_filter(g_voice_models, ESP_MN_PREFIX, ESP_MN_CHINESE);
+    if (modelName == NULL) {
+        ESP_LOGE(TAG, "Chinese MultiNet model not found");
+        return 2U;
+    }
+
+    g_voice_multinet = esp_mn_handle_from_name(modelName);
+    if (g_voice_multinet == NULL) {
+        ESP_LOGE(TAG, "MultiNet interface not found for %s", modelName);
+        return 3U;
+    }
+
+    g_voice_model_data = g_voice_multinet->create(modelName,
+                                                   VOICE_COMMAND_MODEL_TIMEOUT_MS);
+    if (g_voice_model_data == NULL) {
+        ESP_LOGE(TAG, "MultiNet create failed for %s", modelName);
+        return 4U;
+    }
+
+    ret = esp_mn_commands_alloc(g_voice_multinet, g_voice_model_data);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "commands alloc failed: %s", esp_err_to_name(ret));
+        return 5U;
+    }
+
+    ret = esp_mn_commands_add(VOICE_COMMAND_ALARM_ON, "da kai bao jing qi");
+    if (ret == ESP_OK) {
+        ret = esp_mn_commands_add(VOICE_COMMAND_ALARM_OFF, "guan bi bao jing qi");
+    }
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "commands add failed: %s", esp_err_to_name(ret));
+        return 6U;
+    }
+
+    esp_mn_error_t *commandError = esp_mn_commands_update();
+    if (commandError != NULL) {
+        ESP_LOGE(TAG, "commands update rejected %d phrase(s)", commandError->num);
+        return 7U;
+    }
+
+    g_voice_multinet->print_active_speech_commands(g_voice_model_data);
+    ESP_LOGI(TAG, "ready model=%s rate=%d chunk=%d",
+             modelName,
+             g_voice_multinet->get_samp_rate(g_voice_model_data),
+             g_voice_multinet->get_samp_chunksize(g_voice_model_data));
+    return 0U;
+}
+
+static void VoiceCommandExecute(int commandId, const esp_mn_results_t *result)
+{
+    uint32_t action;
+
+    if (commandId == VOICE_COMMAND_ALARM_ON) {
+        action = OHOS_UART_MODULE_ACTION_ON;
+    } else if (commandId == VOICE_COMMAND_ALARM_OFF) {
+        action = OHOS_UART_MODULE_ACTION_OFF;
+    } else {
+        return;
+    }
+
+    uint32_t ok = OhosUartLinkUiSendModuleControl(OHOS_UART_MODULE_DEVICE_ALARM,
+                                                   action);
+    g_voice_detect_count++;
+    ESP_LOGI(TAG,
+             "detected count=%u command=%d action=%u tx=%u text=%s raw=%s",
+             (unsigned)g_voice_detect_count,
+             commandId,
+             (unsigned)action,
+             (unsigned)ok,
+             result != NULL ? result->string : "",
+             result != NULL ? result->raw_string : "");
+}
+
+static void VoiceCommandTask(void *arg)
+{
+    (void)arg;
+
+    uint32_t initRet = VoiceCommandConfigureModel();
+    if (initRet != 0U) {
+        ESP_LOGE(TAG, "service unavailable initRet=%u", (unsigned)initRet);
+        g_voice_task_started = 0;
+        return;
+    }
+
+    int chunkSamples = g_voice_multinet->get_samp_chunksize(g_voice_model_data);
+    int16_t *chunk = (int16_t *)heap_caps_malloc((size_t)chunkSamples * sizeof(int16_t),
+                                                 MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (chunk == NULL) {
+        chunk = (int16_t *)malloc((size_t)chunkSamples * sizeof(int16_t));
+    }
+    if (chunk == NULL) {
+        ESP_LOGE(TAG, "chunk allocation failed samples=%d", chunkSamples);
+        g_voice_task_started = 0;
+        return;
+    }
+
+    OhosAudioEs7210SetPcmTap(VoiceCommandPcmTap, NULL);
+    ESP_LOGI(TAG, "PCM tap active; command detection follows AI uplink capture");
+
+    while (1) {
+        if (g_voice_ring_count < (uint32_t)chunkSamples) {
+            OhosLiteosDelayMs(5U);
+            continue;
+        }
+
+        if (VoiceCommandRingRead(chunk, (uint32_t)chunkSamples) !=
+            (uint32_t)chunkSamples) {
+            continue;
+        }
+
+        esp_mn_state_t state = g_voice_multinet->detect(g_voice_model_data, chunk);
+        if (state == ESP_MN_STATE_DETECTED) {
+            esp_mn_results_t *result =
+                g_voice_multinet->get_results(g_voice_model_data);
+            if (result != NULL && result->num > 0) {
+                VoiceCommandExecute(result->command_id[0], result);
+            }
+            g_voice_multinet->clean(g_voice_model_data);
+            VoiceCommandRingReset();
+            OhosLiteosDelayMs(VOICE_COMMAND_COOLDOWN_MS);
+        } else if (state == ESP_MN_STATE_TIMEOUT) {
+            g_voice_multinet->clean(g_voice_model_data);
+            VoiceCommandRingReset();
+        }
+    }
+}
+
+uint32_t OhosVoiceCommandServiceStart(void)
+{
+    if (g_voice_task_started) {
+        return LOS_OK;
+    }
+
+    g_voice_ring = (int16_t *)heap_caps_calloc(VOICE_COMMAND_RING_SAMPLES,
+                                               sizeof(int16_t),
+                                               MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (g_voice_ring == NULL) {
+        ESP_LOGE(TAG, "ring allocation failed");
+        return 1U;
+    }
+
+    g_voice_task_started = 1U;
+    uint32_t ret = OhosLiteosCreateTask("p4_voice_cmd",
+                                        VoiceCommandTask,
+                                        NULL,
+                                        VOICE_COMMAND_TASK_PRIO,
+                                        VOICE_COMMAND_TASK_STACK,
+                                        NULL);
+    if (ret != LOS_OK) {
+        g_voice_task_started = 0U;
+        heap_caps_free(g_voice_ring);
+        g_voice_ring = NULL;
+        ESP_LOGE(TAG, "task create failed ret=%u", (unsigned)ret);
+        return ret;
+    }
+
+    ESP_LOGI(TAG, "service start requested");
+    return LOS_OK;
+}

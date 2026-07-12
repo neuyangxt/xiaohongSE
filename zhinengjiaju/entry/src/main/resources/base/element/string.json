@@ -1,0 +1,20 @@
+{
+  "string": [
+    {
+      "name": "module_desc",
+      "value": "智能家居中控模块"
+    },
+    {
+      "name": "EntryAbility_desc",
+      "value": "智能家居中控"
+    },
+    {
+      "name": "EntryAbility_label",
+      "value": "智能家居中控"
+    },
+    {
+      "name": "reason_nearlink",
+      "value": "需要星闪权限来扫描和连接智能家居设备"
+    }
+  ]
+}
